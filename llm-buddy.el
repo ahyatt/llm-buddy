@@ -12,7 +12,12 @@
 (require 'project)
 (require 'subr-x)
 (require 'cl-lib)
+(require 'seq)
 (require 'llm)
+
+(defgroup llm-buddy nil
+  "LLM analysis of recent buffer changes."
+  :group 'tools)
 
 (defcustom llm-buddy-coalesce-window 180.0
   "Seconds of idle time after which a buffer's change chunk closes.
@@ -32,17 +37,37 @@ otherwise it starts a new chunk."
   :type 'number
   :group 'llm-buddy)
 
+(defcustom llm-buddy-tracked-modes
+  '(prog-mode text-mode org-mode markdown-mode message-mode)
+  "Major modes whose buffers llm-buddy should track.
+A buffer is tracked when its major mode derives from one of these
+modes.  Internal buffers whose names start with a space or `*' are
+always ignored."
+  :type '(repeat symbol)
+  :group 'llm-buddy)
+
+(defcustom llm-buddy-max-iterations 8
+  "Maximum LLM tool-use iterations for one `llm-buddy-advice' run.
+This bounds provider or prompt failures where the model never calls the
+`end' tool."
+  :type 'integer
+  :group 'llm-buddy)
+
 (defvar llm-buddy-provider nil
   "LLM provider to use for generating feedback.
 
 Must be set by the user.")
 
 (defvar llm-buddy-change-history (make-hash-table :test 'equal)
-  "Hash table mapping a key to its change list (most recent first).
-The key is the project name when the buffer belongs to a project,
-otherwise the buffer name.  Each entry in the list is a plist with
-keys :time, :last-time, :buffer, :project, :mode, :beg, :end,
-:old-text, :new-text.")
+  "Hash table mapping buffer names to change lists, most recent first.
+Each entry in the list is a plist with keys :time, :last-time,
+:buffer, :project, :mode, :beg, :end, :old-text, and :new-text.")
+
+(defvar llm-buddy--last-advice-time nil
+  "Time through which `llm-buddy-advice' last completed successfully.")
+
+(defvar llm-buddy--advice-running nil
+  "Non-nil while an async `llm-buddy-advice' request is running.")
 
 (defvar-local llm-buddy--pending-old-text nil
   "Full lines about to be replaced by the current change.")
@@ -61,17 +86,18 @@ keys :time, :last-time, :buffer, :project, :mode, :beg, :end,
 
 (defun llm-buddy--history-key ()
   "Return the storage key for the current buffer.
-Uses project name if available, otherwise buffer name."
-  (or (llm-buddy--project-name) (buffer-name)))
+Uses buffer names so coalescing remains independent per buffer."
+  (buffer-name))
 
 (defun llm-buddy--tracked-buffer-p (buffer)
   "Return non-nil if BUFFER should be tracked."
-  (let ((name (buffer-name buffer)))
-    (and name (or (not (string-prefix-p " " name))
-                  (not (string-prefix-p "*" name)))
-         (or (provided-mode-derived-p (buffer-local-value 'major-mode buffer)
-                                      'prog-mode)
-             (member major-mode '(text-mode org-mode markdown-mode message-mode))))))
+  (let ((name (buffer-name buffer))
+        (mode (buffer-local-value 'major-mode buffer)))
+    (and name
+         (not (string-prefix-p " " name))
+         (not (string-prefix-p "*" name))
+         llm-buddy-tracked-modes
+         (apply #'provided-mode-derived-p mode llm-buddy-tracked-modes))))
 
 (defun llm-buddy--line-expand-end (pos)
   "Return the end of the line at POS, including the newline if present."
@@ -192,6 +218,7 @@ Return non-nil on success."
             (>= (float-time (time-subtract (current-time)
                                            llm-buddy--auto-last-run))
                 llm-buddy-auto-interval))
+    (message "llm-buddy auto checking for changes")
     (setq llm-buddy--auto-last-run (current-time))
     (llm-buddy-advice)))
 
@@ -222,8 +249,8 @@ Also enables change tracking if not already active."
   "Erase recorded change history."
   (interactive)
   (clrhash llm-buddy-change-history)
-  (clrhash llm-buddy--prompt-hash)
-  (clrhash llm-buddy--last-advice-time))
+  (setq llm-buddy--last-advice-time nil)
+  (setq llm-buddy--advice-running nil))
 
 (defun llm-buddy-changes-since (&optional time)
   "Return recorded changes active at or after TIME, oldest first.
@@ -241,12 +268,23 @@ If TIME is nil, return all recorded changes."
                    (time-less-p (plist-get a :time) (plist-get b :time))))))
 
 (defun llm-buddy-changes-for (key &optional time)
-  "Return changes for KEY (project or buffer name), oldest first.
+  "Return changes for KEY (buffer name), oldest first.
 If TIME is non-nil, only return chunks whose :last-time is at or after TIME."
   (let (result)
     (dolist (entry (gethash key llm-buddy-change-history) result)
       (unless (and time (time-less-p (plist-get entry :last-time) time))
         (push entry result)))))
+
+(defun llm-buddy--reviewable-change-p (change)
+  "Return non-nil if CHANGE still belongs to a reviewable live buffer."
+  (when-let* ((buf (get-buffer (plist-get change :buffer))))
+    (and (buffer-live-p buf)
+         (llm-buddy--tracked-buffer-p buf))))
+
+(defun llm-buddy--reviewable-changes-since (&optional time)
+  "Return reviewable changes active at or after TIME, oldest first."
+  (cl-remove-if-not #'llm-buddy--reviewable-change-p
+                    (llm-buddy-changes-since time)))
 
 (defun llm-buddy--reconstruct-original (entries)
   "Reconstruct the original buffer text by reverse-applying ENTRIES.
@@ -287,9 +325,40 @@ Uses the external diff command for correctness."
             (goto-char (point-min))
             (when (re-search-forward "^@@" nil t)
               (beginning-of-line)
-              (buffer-substring-no-properties (point) (point-max)))))
+              (llm-buddy--number-diff-lines
+               (buffer-substring-no-properties (point) (point-max))))))
       (delete-file orig-file)
       (delete-file curr-file))))
+
+(defun llm-buddy--number-diff-lines (diff)
+  "Annotate DIFF with current-buffer line numbers.
+Context and added lines get their current line number.  Removed lines
+are labeled as old text so the model does not treat them as current
+code locations for notes."
+  (with-temp-buffer
+    (insert diff)
+    (goto-char (point-min))
+    (let ((current-line nil)
+          (out nil))
+      (while (not (eobp))
+        (let ((line (buffer-substring-no-properties
+                     (line-beginning-position) (line-end-position))))
+          (cond
+           ((string-match "^@@ -[0-9]+\\(?:,[0-9]+\\)? \\+\\([0-9]+\\)\\(?:,[0-9]+\\)? @@" line)
+            (setq current-line (string-to-number (match-string 1 line)))
+            (push line out))
+           ((and current-line (string-prefix-p "+" line))
+            (push (format "%6d %s" current-line line) out)
+            (setq current-line (1+ current-line)))
+           ((and current-line (string-prefix-p "-" line))
+            (push (format "   old %s" line) out))
+           ((and current-line (string-prefix-p " " line))
+            (push (format "%6d %s" current-line line) out)
+            (setq current-line (1+ current-line)))
+           (t
+            (push line out))))
+        (forward-line 1))
+      (mapconcat #'identity (nreverse out) "\n"))))
 
 (defun llm-buddy-format-diff (changes)
   "Format CHANGES (oldest first) as a consolidated diff string for an LLM.
@@ -330,13 +399,6 @@ current state, so the LLM sees only what changed overall."
            (concat header diff))))
      (nreverse order)
      "\n")))
-
-(defvar llm-buddy--prompt-hash (make-hash-table :test 'equal)
-  "LLM conversation hash for each project or buffer key.  Keys are the
-same as in `llm-buddy-change-history'.")
-
-(defvar llm-buddy--last-advice-time (make-hash-table :test 'equal)
-  "Hash table mapping a key to the time `llm-buddy-advice' was last called.")
 
 (defface llm-buddy-note-face
   '((t :foreground "dark orange" :slant italic))
@@ -392,7 +454,15 @@ The overlay is removed when the user edits the annotated line."
           (overlay-put ov 'insert-behind-hooks
                        (list #'llm-buddy--note-modification-hook))
           (push ov llm-buddy--note-overlays)
-          (format "Note added at line %d in %s" line-num buffer-name))))))
+          (let ((result (format "Note added at line %d in %s" line-num buffer-name)))
+            (run-hook-with-args
+             'llm-buddy-advice-tool-functions
+             (list :tool "add_note"
+                   :buffer buffer-name
+                   :line line-num
+                   :note note
+                   :result result))
+            result))))))
 
 (defun llm-buddy--show-message (message)
   "Show MESSAGE to the user in a popup buffer."
@@ -401,7 +471,13 @@ The overlay is removed when the user edits the annotated line."
       (goto-char (point-max))
       (insert "\n\n" message)
       (display-buffer buffer 'display-buffer-pop-up-window))
-    "Message shown to user."))
+    (let ((result "Message shown to user."))
+      (run-hook-with-args
+       'llm-buddy-advice-tool-functions
+       (list :tool "show_message"
+             :message message
+             :result result))
+      result)))
 
 (defun llm-buddy--note-modification-hook (ov _after &rest _args)
   "Remove overlay OV when its line is modified."
@@ -485,6 +561,19 @@ the base name (e.g. uniquified names), return a message listing them."
    :description "Indicate that the LLM has no more comments to make at this time, ending the current conversation."
    :args nil))
 
+(defvar llm-buddy-advice-start-functions nil
+  "Abnormal hook run when `llm-buddy-advice' starts an LLM call.
+Each function is called with KEY, CHANGES, and FORMATTED-DIFF.")
+
+(defvar llm-buddy-advice-response-functions nil
+  "Abnormal hook run after each `llm-buddy-advice' LLM response.
+Each function is called with KEY and RESPONSE.")
+
+(defvar llm-buddy-advice-tool-functions nil
+  "Abnormal hook run after each user-facing `llm-buddy-advice' tool call.
+Each function is called with one plist argument describing the tool
+call and its result.")
+
 (defun llm-buddy--instructions ()
   "Return the system instructions string, including project info when available."
   (let* ((proj (project-current))
@@ -496,31 +585,59 @@ the base name (e.g. uniquified names), return a message listing them."
                                 (project-root proj))
                       "")))
     (concat
-     "You are a helpful assistant running in Emacs.  As the user goes about their work, you observe the changes they make to their files.  The changes you see are scoped to a particular project, or, if no project is relevant, a buffer." proj-info "  When asked, you provide feedback on recent changes in the current project, including suggestions for improvement or correction.  You only comment on things that could be improved, and you never say anything if there is nothing worth remarking about.
+     "You are a helpful assistant running in Emacs.  As the user goes about their work, you observe the changes they make to their files.  The changes you see may span multiple changed buffers." proj-info "  When asked, you provide feedback on recent changes in tracked buffers, including suggestions for improvement or correction.  You only comment on things that could be improved, and you never say anything if there is nothing worth remarking about.
 
 The diff headers show where the user's cursor currently is.  The cursor position indicates what the user is actively working on.  Do not comment on incomplete code near the cursor -- the user is still typing.  Only comment on code that appears to be finished, such as completed statements or blocks that the user has moved past.
 
 Only note real problems, not hypothetical ones.  So, for example, note that there a typo, a bug, or a bad idea, but if you see something and wonder if it is correct, but have no evidence to the contrary, ignore it.  Remember that you do not have access to the latest information about the world, so do not try to speculate about the correctness about external facts that seem recent and beyond your range of knowledge.
 
-You have access to tools that allow you to read buffers.  The diffs you receive are in unified diff format, with @@ headers showing line numbers.  Use the read_buffer tool if you need more context around a change.
+You have access to tools that allow you to read buffers.  The diffs you receive are in unified diff format, with @@ headers showing line numbers.  Diff context and added lines are prefixed with the current buffer line number to use with add_note.  Lines prefixed with \"old\" are removed text and are not in the current buffer; do not add notes for problems that only appear in old removed text.  Use the read_buffer tool if you need more context around a change.
 
 To make a note about part of the code, call the add_note tool with the buffer name and line number.  It will result in an Emacs buffer overlay with your note on it.  Or, you can call show_message to show a message to the user.  You can do this as many times as you need to.  When there is nothing left to say, call the end tool.
 
 The user may make changes, and you will have the chance to comment on those changes in another round of tool use.")))
 
-(defun llm-buddy--iterate (key prompt)
-  "Iterate on the conversation for KEY with PROMPT, updating it in place."
-  (llm-chat-async llm-buddy-provider
-                  prompt
-                  (lambda (response)
-                    (unless (assoc "end" (plist-get response :tool-results))
-                      (llm-buddy--iterate key prompt)))
-                  (lambda (_ err)
-                    (message "Error getting LLM advice: %s" (or err "unknown error")))
-                  t))
+(defvar llm-buddy-advice-done-hook nil
+  "Hook run after `llm-buddy-advice' has finished its iteration.")
+
+(defun llm-buddy--finish-advice (&optional reviewed-through)
+  "Finish the current advice run.
+When REVIEWED-THROUGH is non-nil, record that changes through that
+time were reviewed successfully."
+  (when reviewed-through
+    (setq llm-buddy--last-advice-time reviewed-through))
+  (setq llm-buddy--advice-running nil)
+  (run-hooks 'llm-buddy-advice-done-hook))
+
+(defun llm-buddy--iterate (key prompt reviewed-through iterations-left)
+  "Iterate on PROMPT for KEY, updating it in place.
+REVIEWED-THROUGH is recorded only if the model calls `end'.
+ITERATIONS-LEFT bounds the tool-use loop."
+  (if (<= iterations-left 0)
+      (progn
+        (message "llm-buddy stopped: model did not call end within %d iterations"
+                 llm-buddy-max-iterations)
+        (llm-buddy--finish-advice))
+    (condition-case err
+        (llm-chat-async llm-buddy-provider
+                        prompt
+                        (lambda (response)
+                          (run-hook-with-args
+                           'llm-buddy-advice-response-functions key response)
+                          (if (assoc "end" (plist-get response :tool-results))
+                              (llm-buddy--finish-advice reviewed-through)
+                            (llm-buddy--iterate key prompt reviewed-through
+                                                (1- iterations-left))))
+                        (lambda (_ err)
+                          (message "Error getting LLM advice: %s" (or err "unknown error"))
+                          (llm-buddy--finish-advice))
+                        t)
+      (error
+       (message "Error starting LLM advice: %s" (error-message-string err))
+       (llm-buddy--finish-advice)))))
 
 (defun llm-buddy-advice ()
-  "Provide feedback on recent changes in the current buffer's project.
+  "Provide feedback on recent changes in all tracked buffers.
 
 May not do anything, if there is nothing worth remarking about.  Will
 only offer corrections or suggestions.
@@ -528,26 +645,43 @@ only offer corrections or suggestions.
 The output is either displayed in a temporary buffer, or added as
 overlay text in the relevant buffer, or both, depending on the need."
   (interactive)
-  (when-let* ((key (llm-buddy--history-key))
-              (changes (llm-buddy-changes-for
-                        key (gethash key llm-buddy--last-advice-time)))
-              (formatted (llm-buddy-format-diff changes)))
-    (let ((prompt (or (when-let* ((existing (gethash key llm-buddy--prompt-hash)))
-                        (llm-chat-prompt-append-response
-                         existing formatted 'user)
-                        existing)
-                      (let ((p (llm-make-chat-prompt
-                                formatted
-                                :context (llm-buddy--instructions)
-                                :tools (list llm-buddy-tool-read-buffer
-                                             llm-buddy-tool-note
-                                             llm-buddy-tool-message
-                                             llm-buddy-tool-end)
-                                :tool-options (make-llm-tool-options :tool-choice 'any))))
-                        (puthash key p llm-buddy--prompt-hash)
-                        p))))
-      (puthash key (current-time) llm-buddy--last-advice-time)
-      (llm-buddy--iterate key prompt))))
+  (if llm-buddy--advice-running
+      (message "llm-buddy advice already running")
+    (let* ((key 'all-changed-buffers)
+           (reviewed-through (current-time))
+           (changes (llm-buddy--reviewable-changes-since
+                     llm-buddy--last-advice-time))
+           (formatted (llm-buddy-format-diff changes)))
+      (cond
+       ((null changes)
+        (message "llm-buddy checked: no changed tracked buffers"))
+       ((string-empty-p formatted)
+        (message "llm-buddy checked: no net diff to review")
+        (setq llm-buddy--last-advice-time reviewed-through))
+       (t
+        (unless llm-buddy-provider
+          (user-error "No LLM provider configured; set `llm-buddy-provider'"))
+        (let* ((buffers (seq-uniq (mapcar (lambda (change)
+                                             (plist-get change :buffer))
+                                           changes)))
+               (prompt (llm-make-chat-prompt
+                        formatted
+                        :context (llm-buddy--instructions)
+                        :tools (list llm-buddy-tool-read-buffer
+                                     llm-buddy-tool-note
+                                     llm-buddy-tool-message
+                                     llm-buddy-tool-end)
+                        :tool-options (make-llm-tool-options :tool-choice 'any))))
+          (message "llm-buddy checking %d change%s across %d buffer%s"
+                   (length changes)
+                   (if (= (length changes) 1) "" "s")
+                   (length buffers)
+                   (if (= (length buffers) 1) "" "s"))
+          (run-hook-with-args
+           'llm-buddy-advice-start-functions key changes formatted)
+          (setq llm-buddy--advice-running t)
+          (llm-buddy--iterate key prompt reviewed-through
+                              llm-buddy-max-iterations)))))))
 
 
 (provide 'llm-buddy)
