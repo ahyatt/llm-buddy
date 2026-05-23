@@ -27,12 +27,12 @@ otherwise it starts a new chunk."
   :type 'number
   :group 'llm-buddy)
 
-(defcustom llm-buddy-auto-interval 300
+(defcustom llm-buddy-auto-interval 60
   "Minimum seconds between automatic `llm-buddy-advice' runs."
   :type 'number
   :group 'llm-buddy)
 
-(defcustom llm-buddy-auto-idle-delay 30
+(defcustom llm-buddy-auto-idle-delay 10
   "Seconds of idle time before automatic advice runs."
   :type 'number
   :group 'llm-buddy)
@@ -59,15 +59,22 @@ This bounds provider or prompt failures where the model never calls the
 Must be set by the user.")
 
 (defvar llm-buddy-change-history (make-hash-table :test 'equal)
-  "Hash table mapping buffer names to change lists, most recent first.
+  "Hash table mapping scope keys to change lists, most recent first.
 Each entry in the list is a plist with keys :time, :last-time,
-:buffer, :project, :mode, :beg, :end, :old-text, and :new-text.")
+:scope-key, :scope-description, :buffer, :project, :mode, :beg,
+:end, :old-text, and :new-text.")
 
 (defvar llm-buddy--last-advice-time nil
-  "Time through which `llm-buddy-advice' last completed successfully.")
+  "Fallback time through which `llm-buddy-advice' last completed successfully.")
+
+(defvar llm-buddy--last-advice-times (make-hash-table :test 'equal)
+  "Hash table mapping scope keys to last successful advice times.")
 
 (defvar llm-buddy--advice-running nil
   "Non-nil while an async `llm-buddy-advice' request is running.")
+
+(defvar llm-buddy--active-advice-scope-key nil
+  "Scope key for the currently running advice request.")
 
 (defvar-local llm-buddy--pending-old-text nil
   "Full lines about to be replaced by the current change.")
@@ -84,10 +91,36 @@ Each entry in the list is a plist with keys :time, :last-time,
       (file-name-nondirectory
        (directory-file-name (project-root proj)))))))
 
+(defun llm-buddy--project-root ()
+  "Return the current project's root directory, or nil."
+  (when buffer-file-name
+    (when-let* ((proj (ignore-errors (project-current))))
+      (when (fboundp 'project-root)
+        (expand-file-name (project-root proj))))))
+
+(defun llm-buddy--scope ()
+  "Return the current buffer's llm-buddy scope.
+Project buffers are scoped by project root.  Buffers without a project
+are scoped by buffer name."
+  (if-let* ((root (llm-buddy--project-root)))
+      (let ((name (or (llm-buddy--project-name)
+                      (file-name-nondirectory
+                       (directory-file-name root)))))
+        (list :key (concat "project:" root)
+              :type 'project
+              :description (format "project %s at %s" name root)
+              :project name
+              :root root))
+    (list :key (concat "buffer:" (buffer-name))
+          :type 'buffer
+          :description (format "buffer %s" (buffer-name))
+          :buffer (buffer-name))))
+
 (defun llm-buddy--history-key ()
   "Return the storage key for the current buffer.
-Uses buffer names so coalescing remains independent per buffer."
-  (buffer-name))
+Project buffers share a project key.  Non-project buffers use their
+buffer name."
+  (plist-get (llm-buddy--scope) :key))
 
 (defun llm-buddy--tracked-buffer-p (buffer)
   "Return non-nil if BUFFER should be tracked."
@@ -146,24 +179,20 @@ OLD-TEXT is the text it replaced; NEW-TEXT is the text it inserted."
   "Try to merge a change into the top of KEY's change list.
 Return non-nil on success."
   (let* ((entries (gethash key llm-buddy-change-history))
-         (top (car entries))
+         (top (seq-find (lambda (entry)
+                          (equal (plist-get entry :buffer) (buffer-name)))
+                        entries))
          (now (current-time)))
     (when (and top
-               (equal (plist-get top :buffer) (buffer-name))
                (<= (float-time (time-subtract now (plist-get top :last-time)))
                    llm-buddy-coalesce-window))
       (when-let* ((merged (llm-buddy--merge-region top beg old-text new-text)))
         (cl-destructuring-bind (new-beg new-old new-new) merged
-          (setcar entries
-                  (list :time (plist-get top :time)
-                        :last-time now
-                        :buffer (plist-get top :buffer)
-                        :project (plist-get top :project)
-                        :mode (plist-get top :mode)
-                        :beg new-beg
-                        :end (+ new-beg (length new-new))
-                        :old-text new-old
-                        :new-text new-new)))
+          (setf (plist-get top :last-time) now)
+          (setf (plist-get top :beg) new-beg)
+          (setf (plist-get top :end) (+ new-beg (length new-new)))
+          (setf (plist-get top :old-text) new-old)
+          (setf (plist-get top :new-text) new-new))
         t))))
 
 (defun llm-buddy--after-change (beg end _len)
@@ -174,7 +203,8 @@ Return non-nil on success."
            (line-end (llm-buddy--line-expand-end end))
            (new-text (buffer-substring-no-properties line-beg line-end))
            (old-text (or llm-buddy--pending-old-text ""))
-           (key (llm-buddy--history-key)))
+           (scope (llm-buddy--scope))
+           (key (plist-get scope :key)))
       (setq llm-buddy--pending-old-text nil
             llm-buddy--pending-beg nil)
       (unless (llm-buddy--try-merge key line-beg old-text new-text)
@@ -182,8 +212,11 @@ Return non-nil on success."
           (puthash key
                    (cons (list :time now
                                :last-time now
+                               :scope-key key
+                               :scope-description
+                               (plist-get scope :description)
                                :buffer (buffer-name)
-                               :project (llm-buddy--project-name)
+                               :project (plist-get scope :project)
                                :mode major-mode
                                :beg line-beg
                                :end line-end
@@ -192,19 +225,43 @@ Return non-nil on success."
                          (gethash key llm-buddy-change-history))
                    llm-buddy-change-history))))))
 
-;;;###autoload
-(defun llm-buddy-enable ()
-  "Begin tracking buffer changes."
-  (interactive)
-  (add-hook 'before-change-functions #'llm-buddy--before-change)
-  (add-hook 'after-change-functions #'llm-buddy--after-change))
+(defun llm-buddy--record-current-buffer ()
+  "Begin recording changes in the current buffer."
+  (add-hook 'before-change-functions #'llm-buddy--before-change nil t)
+  (add-hook 'after-change-functions #'llm-buddy--after-change nil t))
 
-;;;###autoload
+(defun llm-buddy--stop-recording-current-buffer ()
+  "Stop recording changes in the current buffer."
+  (remove-hook 'before-change-functions #'llm-buddy--before-change t)
+  (remove-hook 'after-change-functions #'llm-buddy--after-change t))
+
+(defun llm-buddy--record-changes ()
+  "Begin recording buffer changes in existing and future buffers."
+  (add-hook 'after-change-major-mode-hook
+            #'llm-buddy--record-current-buffer)
+  (dolist (buffer (buffer-list))
+    (with-current-buffer buffer
+      (llm-buddy--record-current-buffer))))
+
+(defun llm-buddy--stop-recording-changes ()
+  "Stop recording buffer changes in existing and future buffers."
+  (remove-hook 'after-change-major-mode-hook
+               #'llm-buddy--record-current-buffer)
+  (dolist (buffer (buffer-list))
+    (with-current-buffer buffer
+      (llm-buddy--stop-recording-current-buffer))))
+
+(defun llm-buddy-enable ()
+  "Begin recording buffer changes.
+This compatibility function is not interactive; use
+`llm-buddy-global-mode' to enable llm-buddy."
+  (llm-buddy--record-changes))
+
 (defun llm-buddy-disable ()
-  "Stop tracking buffer changes."
-  (interactive)
-  (remove-hook 'before-change-functions #'llm-buddy--before-change)
-  (remove-hook 'after-change-functions #'llm-buddy--after-change))
+  "Stop recording buffer changes.
+This compatibility function is not interactive; use
+`llm-buddy-global-mode' to disable llm-buddy."
+  (llm-buddy--stop-recording-changes))
 
 (defvar llm-buddy--auto-timer nil
   "Idle timer for automatic advice, or nil when not running.")
@@ -222,53 +279,81 @@ Return non-nil on success."
     (setq llm-buddy--auto-last-run (current-time))
     (llm-buddy-advice)))
 
-;;;###autoload
-(defun llm-buddy-auto-start ()
-  "Start running `llm-buddy-advice' automatically on idle.
-Also enables change tracking if not already active."
-  (interactive)
-  (llm-buddy-enable)
+(defun llm-buddy--start-auto-timer ()
+  "Start the automatic advice idle timer."
   (when llm-buddy--auto-timer
     (cancel-timer llm-buddy--auto-timer))
   (setq llm-buddy--auto-timer
         (run-with-idle-timer llm-buddy-auto-idle-delay t
                              #'llm-buddy--auto-maybe-run))
-  (message "llm-buddy auto advice started (every %ds, after %ds idle)"
+  (message "llm-buddy started (every %ds, after %ds idle)"
            llm-buddy-auto-interval llm-buddy-auto-idle-delay))
+
+(defun llm-buddy--stop-auto-timer ()
+  "Stop the automatic advice idle timer."
+  (when llm-buddy--auto-timer
+    (cancel-timer llm-buddy--auto-timer)
+    (setq llm-buddy--auto-timer nil))
+  (message "llm-buddy stopped"))
+
+;;;###autoload
+(define-minor-mode llm-buddy-global-mode
+  "Toggle llm-buddy in all buffers.
+When enabled, llm-buddy records changes in tracked buffers and checks
+them automatically on idle."
+  :global t
+  :group 'llm-buddy
+  :lighter " Buddy"
+  (if llm-buddy-global-mode
+      (progn
+        (llm-buddy--record-changes)
+        (llm-buddy--start-auto-timer))
+    (llm-buddy--stop-auto-timer)
+    (llm-buddy--stop-recording-changes)))
+
+;;;###autoload
+(defun llm-buddy-auto-start ()
+  "Start running `llm-buddy-advice' automatically on idle.
+Also enables change tracking if not already active."
+  (interactive)
+  (llm-buddy-global-mode 1))
 
 ;;;###autoload
 (defun llm-buddy-auto-stop ()
   "Stop automatic advice runs."
   (interactive)
-  (when llm-buddy--auto-timer
-    (cancel-timer llm-buddy--auto-timer)
-    (setq llm-buddy--auto-timer nil))
-  (message "llm-buddy auto advice stopped"))
+  (llm-buddy-global-mode 0))
 
 (defun llm-buddy-clear-history ()
   "Erase recorded change history."
   (interactive)
   (clrhash llm-buddy-change-history)
+  (clrhash llm-buddy--last-advice-times)
   (setq llm-buddy--last-advice-time nil)
   (setq llm-buddy--advice-running nil))
 
-(defun llm-buddy-changes-since (&optional time)
+(defun llm-buddy-changes-since (&optional time scope-key)
   "Return recorded changes active at or after TIME, oldest first.
 A chunk is included when its :last-time is at or after TIME, so a
 still-growing burst that started before TIME is still returned.
-If TIME is nil, return all recorded changes."
+If TIME is nil, return all recorded changes.
+When SCOPE-KEY is non-nil, only return changes in that scope."
   (let (result)
-    (maphash
-     (lambda (_key entries)
-       (dolist (entry entries)
-         (unless (time-less-p (plist-get entry :last-time) (or time '(0 0)))
-           (push entry result))))
-     llm-buddy-change-history)
+    (if scope-key
+        (dolist (entry (gethash scope-key llm-buddy-change-history))
+          (unless (time-less-p (plist-get entry :last-time) (or time '(0 0)))
+            (push entry result)))
+      (maphash
+       (lambda (_key entries)
+         (dolist (entry entries)
+           (unless (time-less-p (plist-get entry :last-time) (or time '(0 0)))
+             (push entry result))))
+       llm-buddy-change-history))
     (sort result (lambda (a b)
                    (time-less-p (plist-get a :time) (plist-get b :time))))))
 
 (defun llm-buddy-changes-for (key &optional time)
-  "Return changes for KEY (buffer name), oldest first.
+  "Return changes for KEY (scope key), oldest first.
 If TIME is non-nil, only return chunks whose :last-time is at or after TIME."
   (let (result)
     (dolist (entry (gethash key llm-buddy-change-history) result)
@@ -281,10 +366,11 @@ If TIME is non-nil, only return chunks whose :last-time is at or after TIME."
     (and (buffer-live-p buf)
          (llm-buddy--tracked-buffer-p buf))))
 
-(defun llm-buddy--reviewable-changes-since (&optional time)
-  "Return reviewable changes active at or after TIME, oldest first."
+(defun llm-buddy--reviewable-changes-since (&optional time scope-key)
+  "Return reviewable changes active at or after TIME, oldest first.
+When SCOPE-KEY is non-nil, only return changes in that scope."
   (cl-remove-if-not #'llm-buddy--reviewable-change-p
-                    (llm-buddy-changes-since time)))
+                    (llm-buddy-changes-since time scope-key)))
 
 (defun llm-buddy--reconstruct-original (entries)
   "Reconstruct the original buffer text by reverse-applying ENTRIES.
@@ -408,6 +494,82 @@ current state, so the LLM sees only what changed overall."
 (defvar llm-buddy--note-overlays nil
   "List of active note overlays created by llm-buddy.")
 
+(defvar llm-buddy--notes nil
+  "List of notes created by llm-buddy, most recent first.")
+
+(defvar llm-buddy--next-note-id 1
+  "Next note id to assign.")
+
+(defun llm-buddy--note-line (note)
+  "Return NOTE's current line number when possible."
+  (let ((ov (plist-get note :overlay)))
+    (if (and (overlayp ov) (overlay-buffer ov))
+        (with-current-buffer (overlay-buffer ov)
+          (line-number-at-pos (overlay-start ov)))
+      (plist-get note :line))))
+
+(defun llm-buddy--note-scope-key (note)
+  "Return NOTE's scope key, deriving it for legacy notes if needed."
+  (or (plist-get note :scope-key)
+      (when-let* ((buf (get-buffer (plist-get note :buffer))))
+        (with-current-buffer buf
+          (plist-get (llm-buddy--scope) :key)))))
+
+(defun llm-buddy--find-note (note-id &optional scope-key)
+  "Return the note with NOTE-ID, or nil.
+When SCOPE-KEY is non-nil, only match notes in that scope."
+  (let ((id (if (stringp note-id) (string-to-number note-id) note-id)))
+    (seq-find (lambda (note)
+                (and (= (plist-get note :id) id)
+                     (or (null scope-key)
+                         (equal (llm-buddy--note-scope-key note)
+                                scope-key))))
+              llm-buddy--notes)))
+
+(defun llm-buddy--dismiss-note-record (note &optional reason)
+  "Mark NOTE as dismissed and delete its overlay.
+REASON describes what dismissed the note."
+  (let ((ov (plist-get note :overlay)))
+    (when (overlayp ov)
+      (setq llm-buddy--note-overlays (delq ov llm-buddy--note-overlays))
+      (delete-overlay ov)))
+  (setf (plist-get note :status) 'dismissed)
+  (setf (plist-get note :dismissed-time) (current-time))
+  (setf (plist-get note :dismissed-reason) (or reason "removed"))
+  note)
+
+(defun llm-buddy--notes-for-scope (scope-key)
+  "Return notes for SCOPE-KEY, newest first."
+  (cl-remove-if-not
+   (lambda (note)
+     (equal (llm-buddy--note-scope-key note) scope-key))
+   llm-buddy--notes))
+
+(defun llm-buddy--format-notes (&optional scope-key)
+  "Return a string describing previous notes in SCOPE-KEY for the agent.
+When SCOPE-KEY is nil, use the current buffer's scope."
+  (let* ((key (or scope-key (plist-get (llm-buddy--scope) :key)))
+         (notes (llm-buddy--notes-for-scope key)))
+    (if (null notes)
+        ""
+      (concat
+       "\n\nPrevious llm-buddy notes for this scope, newest first.  Active notes are still visible in Emacs; dismissed notes are no longer visible but should still be considered so you do not repeat stale feedback.\n"
+       (mapconcat
+        (lambda (note)
+          (let ((status (plist-get note :status)))
+            (format "- note_id %d [%s] %s:%d: %s%s"
+                    (plist-get note :id)
+                    status
+                    (plist-get note :buffer)
+                    (llm-buddy--note-line note)
+                    (plist-get note :note)
+                    (if (eq status 'dismissed)
+                        (format " (dismissed: %s)"
+                                (or (plist-get note :dismissed-reason) "unknown"))
+                      ""))))
+        notes
+        "\n")))))
+
 (defun llm-buddy--find-buffer (buffer-name)
   "Return the buffer named BUFFER-NAME, or an error string.
 When no exact match exists, look for buffers whose name ends with
@@ -433,36 +595,79 @@ The overlay is removed when the user edits the annotated line."
          (line-num (if (stringp line-number)
                        (string-to-number line-number)
                      line-number)))
-    (when (stringp buf)
-      (cl-return-from llm-buddy--add-note buf))
-    (with-current-buffer buf
-      (save-excursion
-        (goto-char (point-min))
-        (forward-line (1- line-num))
-        (let* ((line-beg (line-beginning-position))
-               (line-end (line-end-position))
-               (ov (make-overlay line-beg line-end buf nil t)))
-          ;; We want the overlay to stay in line with the text noted.
-          (overlay-put ov 'after-string
-                       (propertize (concat " " note)
-                                   'face 'llm-buddy-note-face))
-          (overlay-put ov 'llm-buddy-note t)
-          (overlay-put ov 'modification-hooks
-                       (list #'llm-buddy--note-modification-hook))
-          (overlay-put ov 'insert-in-front-hooks
-                       (list #'llm-buddy--note-modification-hook))
-          (overlay-put ov 'insert-behind-hooks
-                       (list #'llm-buddy--note-modification-hook))
-          (push ov llm-buddy--note-overlays)
-          (let ((result (format "Note added at line %d in %s" line-num buffer-name)))
-            (run-hook-with-args
-             'llm-buddy-advice-tool-functions
-             (list :tool "add_note"
-                   :buffer buffer-name
-                   :line line-num
-                   :note note
-                   :result result))
-            result))))))
+    (if (stringp buf)
+        buf
+      (with-current-buffer buf
+        (let* ((scope (llm-buddy--scope))
+               (scope-key (plist-get scope :key)))
+          (if (and llm-buddy--active-advice-scope-key
+                   (not (equal scope-key llm-buddy--active-advice-scope-key)))
+              (format "Cannot add note to %s because it is outside the current advice scope (%s)."
+                      (buffer-name buf)
+                      llm-buddy--active-advice-scope-key)
+            (save-excursion
+              (goto-char (point-min))
+              (forward-line (1- line-num))
+              (let* ((line-beg (line-beginning-position))
+                     (line-end (line-end-position))
+                     (ov (make-overlay line-beg line-end buf nil t))
+                     (id llm-buddy--next-note-id)
+                     (record (list :id id
+                                   :status 'active
+                                   :dismissed-time nil
+                                   :dismissed-reason nil
+                                   :scope-key scope-key
+                                   :scope-description
+                                   (plist-get scope :description)
+                                   :buffer (buffer-name buf)
+                                   :line line-num
+                                   :note note
+                                   :time (current-time)
+                                   :overlay ov)))
+                (setq llm-buddy--next-note-id (1+ llm-buddy--next-note-id))
+                ;; We want the overlay to stay in line with the text noted.
+                (overlay-put ov 'after-string
+                             (propertize (concat " " note)
+                                         'face 'llm-buddy-note-face))
+                (overlay-put ov 'llm-buddy-note t)
+                (overlay-put ov 'llm-buddy-note-record record)
+                (overlay-put ov 'modification-hooks
+                             (list #'llm-buddy--note-modification-hook))
+                (overlay-put ov 'insert-in-front-hooks
+                             (list #'llm-buddy--note-modification-hook))
+                (overlay-put ov 'insert-behind-hooks
+                             (list #'llm-buddy--note-modification-hook))
+                (push ov llm-buddy--note-overlays)
+                (push record llm-buddy--notes)
+                (let ((result (format "Note %d added at line %d in %s"
+                                      id line-num buffer-name)))
+                  (run-hook-with-args
+                   'llm-buddy-advice-tool-functions
+                   (list :tool "add_note"
+                         :note-id id
+                         :buffer buffer-name
+                         :line line-num
+                         :note note
+                         :result result))
+                  result)))))))))
+
+(defun llm-buddy--remove-note (note-id)
+  "Remove the active note NOTE-ID, keeping dismissed note history."
+  (let ((note (llm-buddy--find-note note-id llm-buddy--active-advice-scope-key)))
+    (cond
+     ((null note)
+      (format "Note not found: %s" note-id))
+     ((eq (plist-get note :status) 'dismissed)
+      (format "Note %d was already dismissed." (plist-get note :id)))
+     (t
+      (llm-buddy--dismiss-note-record note "removed by agent")
+      (let ((result (format "Note %d removed." (plist-get note :id))))
+        (run-hook-with-args
+         'llm-buddy-advice-tool-functions
+         (list :tool "remove_note"
+               :note-id (plist-get note :id)
+               :result result))
+        result)))))
 
 (defun llm-buddy--show-message (message)
   "Show MESSAGE to the user in a popup buffer."
@@ -482,8 +687,10 @@ The overlay is removed when the user edits the annotated line."
 (defun llm-buddy--note-modification-hook (ov _after &rest _args)
   "Remove overlay OV when its line is modified."
   (when (overlayp ov)
-    (setq llm-buddy--note-overlays (delq ov llm-buddy--note-overlays))
-    (delete-overlay ov)))
+    (if-let* ((note (overlay-get ov 'llm-buddy-note-record)))
+        (llm-buddy--dismiss-note-record note "line edited")
+      (setq llm-buddy--note-overlays (delq ov llm-buddy--note-overlays))
+      (delete-overlay ov))))
 
 (defun llm-buddy-dismiss-note ()
   "Remove the llm-buddy note overlay on the current line, if any."
@@ -491,8 +698,10 @@ The overlay is removed when the user edits the annotated line."
   (let ((dominated nil))
     (dolist (ov (overlays-in (line-beginning-position) (line-end-position)))
       (when (and (overlayp ov) (overlay-get ov 'llm-buddy-note))
-        (setq llm-buddy--note-overlays (delq ov llm-buddy--note-overlays))
-        (delete-overlay ov)
+        (if-let* ((note (overlay-get ov 'llm-buddy-note-record)))
+            (llm-buddy--dismiss-note-record note "dismissed by user")
+          (setq llm-buddy--note-overlays (delq ov llm-buddy--note-overlays))
+          (delete-overlay ov))
         (setq dominated t)))
     (unless dominated
       (message "No llm-buddy note on this line"))))
@@ -502,7 +711,9 @@ The overlay is removed when the user edits the annotated line."
   (interactive)
   (dolist (ov llm-buddy--note-overlays)
     (when (overlayp ov)
-      (delete-overlay ov)))
+      (if-let* ((note (overlay-get ov 'llm-buddy-note-record)))
+          (llm-buddy--dismiss-note-record note "dismissed by user")
+        (delete-overlay ov))))
   (setq llm-buddy--note-overlays nil))
 
 (defun llm-buddy--read-buffer (buffer-name &optional begin end)
@@ -546,6 +757,13 @@ the base name (e.g. uniquified names), return a message listing them."
    :args '((:name "buffer" :type string :description "Name of the buffer to annotate." :required t)
            (:name "line_number" :type integer :description "Line number to annotate." :required t)
            (:name "note" :type string :description "The content of the note to add.  Should be a suggestion or comment about something the user should look at." :required t))))
+
+(defconst llm-buddy-tool-remove-note
+  (make-llm-tool
+   :function #'llm-buddy--remove-note
+   :name "remove_note"
+   :description "Remove one of your previous active notes by note_id.  This dismisses the visible Emacs overlay but keeps the note in history as dismissed."
+   :args '((:name "note_id" :type integer :description "The note_id from the previous notes list." :required t))))
 
 (defconst llm-buddy-tool-message
   (make-llm-tool
@@ -593,7 +811,9 @@ Only note real problems, not hypothetical ones.  So, for example, note that ther
 
 You have access to tools that allow you to read buffers.  The diffs you receive are in unified diff format, with @@ headers showing line numbers.  Diff context and added lines are prefixed with the current buffer line number to use with add_note.  Lines prefixed with \"old\" are removed text and are not in the current buffer; do not add notes for problems that only appear in old removed text.  Use the read_buffer tool if you need more context around a change.
 
-To make a note about part of the code, call the add_note tool with the buffer name and line number.  It will result in an Emacs buffer overlay with your note on it.  Or, you can call show_message to show a message to the user.  You can do this as many times as you need to.  When there is nothing left to say, call the end tool.
+To make a note about part of the code, call the add_note tool with the buffer name and line number.  It will result in an Emacs buffer overlay with your note on it.  The tool result includes the note_id.  If an active previous note is no longer useful, call remove_note with its note_id.  Or, you can call show_message to show a message to the user.  You can do this as many times as you need to.  When there is nothing left to say, call the end tool.
+
+The current review is scoped to either the current project or the current non-project buffer.  Only add notes to buffers shown in this review scope.
 
 The user may make changes, and you will have the chance to comment on those changes in another round of tool use.")))
 
@@ -605,7 +825,11 @@ The user may make changes, and you will have the chance to comment on those chan
 When REVIEWED-THROUGH is non-nil, record that changes through that
 time were reviewed successfully."
   (when reviewed-through
-    (setq llm-buddy--last-advice-time reviewed-through))
+    (setq llm-buddy--last-advice-time reviewed-through)
+    (when llm-buddy--active-advice-scope-key
+      (puthash llm-buddy--active-advice-scope-key reviewed-through
+               llm-buddy--last-advice-times)))
+  (setq llm-buddy--active-advice-scope-key nil)
   (setq llm-buddy--advice-running nil)
   (run-hooks 'llm-buddy-advice-done-hook))
 
@@ -645,30 +869,35 @@ only offer corrections or suggestions.
 The output is either displayed in a temporary buffer, or added as
 overlay text in the relevant buffer, or both, depending on the need."
   (interactive)
-  (if llm-buddy--advice-running
-      (message "llm-buddy advice already running")
-    (let* ((key 'all-changed-buffers)
+  (unless llm-buddy--advice-running
+    (let* ((scope (llm-buddy--scope))
+           (key (plist-get scope :key))
+           (last-advice-time (gethash key llm-buddy--last-advice-times))
            (reviewed-through (current-time))
            (changes (llm-buddy--reviewable-changes-since
-                     llm-buddy--last-advice-time))
-           (formatted (llm-buddy-format-diff changes)))
+                     last-advice-time key))
+           (diff-formatted (llm-buddy-format-diff changes))
+           (formatted (concat diff-formatted (llm-buddy--format-notes key))))
       (cond
        ((null changes)
-        (message "llm-buddy checked: no changed tracked buffers"))
-       ((string-empty-p formatted)
+        (message "llm-buddy checked: no changed tracked buffers in %s"
+                 (plist-get scope :description)))
+       ((string-empty-p diff-formatted)
         (message "llm-buddy checked: no net diff to review")
+        (puthash key reviewed-through llm-buddy--last-advice-times)
         (setq llm-buddy--last-advice-time reviewed-through))
        (t
         (unless llm-buddy-provider
           (user-error "No LLM provider configured; set `llm-buddy-provider'"))
         (let* ((buffers (seq-uniq (mapcar (lambda (change)
-                                             (plist-get change :buffer))
-                                           changes)))
+                                            (plist-get change :buffer))
+                                          changes)))
                (prompt (llm-make-chat-prompt
                         formatted
                         :context (llm-buddy--instructions)
                         :tools (list llm-buddy-tool-read-buffer
                                      llm-buddy-tool-note
+                                     llm-buddy-tool-remove-note
                                      llm-buddy-tool-message
                                      llm-buddy-tool-end)
                         :tool-options (make-llm-tool-options :tool-choice 'any))))
@@ -679,6 +908,7 @@ overlay text in the relevant buffer, or both, depending on the need."
                    (if (= (length buffers) 1) "" "s"))
           (run-hook-with-args
            'llm-buddy-advice-start-functions key changes formatted)
+          (setq llm-buddy--active-advice-scope-key key)
           (setq llm-buddy--advice-running t)
           (llm-buddy--iterate key prompt reviewed-through
                               llm-buddy-max-iterations)))))))
