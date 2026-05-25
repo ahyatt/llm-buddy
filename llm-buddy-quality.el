@@ -1,5 +1,27 @@
 ;;; llm-buddy-quality.el --- Judged quality cases for llm-buddy -*- lexical-binding: t; -*-
 
+;; Copyright (c) 2026  Andrew Hyatt <ahyatt@gmail.com>
+
+;; Author: Andrew Hyatt <ahyatt@gmail.com>
+;; Homepage: https://github.com/ahyatt/llm-buddy
+;; Package-Requires: ((emacs "28.1") (llm "0.30.0"))
+;; Keywords: convenience, tools
+;; Version: 0.1.0
+;; SPDX-License-Identifier: GPL-3.0-or-later
+;;
+;; This program is free software; you can redistribute it and/or
+;; modify it under the terms of the GNU General Public License as
+;; published by the Free Software Foundation; either version 3 of the
+;; License, or (at your option) any later version.
+;;
+;; This program is distributed in the hope that it will be useful, but
+;; WITHOUT ANY WARRANTY; without even the implied warranty of
+;; MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+;; General Public License for more details.
+;;
+;; You should have received a copy of the GNU General Public License
+;; along with GNU Emacs.  If not, see <http://www.gnu.org/licenses/>.
+
 ;;; Commentary:
 
 ;; Capture the last `llm-buddy-advice' run for manual judging.  Enable
