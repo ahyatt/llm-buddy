@@ -41,6 +41,8 @@ Load the package and configure an ~llm~ provider:
 (setq llm-buddy-provider my-llm-provider)
 #+end_src
 
+For details on setting up providers, see [[https://github.com/ahyatt/llm][the LLM package]].  The LLM package supports most major providers, including local ones.
+
 Then enable automatic review:
 
 #+begin_src emacs-lisp
