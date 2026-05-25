@@ -128,7 +128,6 @@ buffer name."
         (mode (buffer-local-value 'major-mode buffer)))
     (and name
          (not (string-prefix-p " " name))
-         (not (string-prefix-p "*" name))
          llm-buddy-tracked-modes
          (apply #'provided-mode-derived-p mode llm-buddy-tracked-modes))))
 
