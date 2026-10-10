@@ -64,7 +64,7 @@ otherwise it starts a new chunk."
   :type 'number
   :group 'llm-buddy)
 
-(defcustom llm-buddy-decision-idle-delay 2
+(defcustom llm-buddy-decision-idle-delay 0.5
   "Idle seconds before checking changes with a decision provider."
   :type 'number
   :group 'llm-buddy)
@@ -349,7 +349,7 @@ Return non-nil on success."
   (setq llm-buddy--auto-timer
         (run-with-idle-timer (min llm-buddy-auto-idle-delay
                                   llm-buddy-decision-idle-delay) t
-                             #'llm-buddy--auto-maybe-run))
+                                  #'llm-buddy--auto-maybe-run))
   (message "llm-buddy started (every %ds, after %ds idle)"
            llm-buddy-auto-interval llm-buddy-auto-idle-delay))
 
