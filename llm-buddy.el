@@ -4,7 +4,7 @@
 
 ;; Author: Andrew Hyatt <ahyatt@gmail.com>
 ;; Homepage: https://github.com/ahyatt/llm-buddy
-;; Package-Requires: ((emacs "28.1") (llm "0.30.0"))
+;; Package-Requires: ((emacs "28.1") (llm "0.33.0"))
 ;; Keywords: convenience, tools
 ;; Version: 0.1.0
 ;; SPDX-License-Identifier: GPL-3.0-or-later
@@ -59,6 +59,16 @@ otherwise it starts a new chunk."
   :type 'number
   :group 'llm-buddy)
 
+(defcustom llm-buddy-decision-interval 5
+  "Minimum seconds between automatic checks with a decision provider."
+  :type 'number
+  :group 'llm-buddy)
+
+(defcustom llm-buddy-decision-idle-delay 2
+  "Idle seconds before checking changes with a decision provider."
+  :type 'number
+  :group 'llm-buddy)
+
 (defcustom llm-buddy-tracked-modes
   '(prog-mode text-mode org-mode markdown-mode message-mode)
   "Major modes whose buffers llm-buddy should track.
@@ -108,6 +118,10 @@ the most serious problems ever get pointed out, which may mean that
   "LLM provider to use for generating feedback.
 
 Must be set by the user.")
+
+(defvar llm-buddy-decision-provider nil
+  "Provider for quick diff and existing-note decisions.
+When nil, every review uses `llm-buddy-provider' as before.")
 
 (defvar llm-buddy-change-history (make-hash-table :test 'equal)
   "Hash table mapping scope keys to change lists, most recent first.
@@ -315,10 +329,16 @@ Return non-nil on success."
 
 (defun llm-buddy--auto-maybe-run ()
   "Run `llm-buddy-advice' if enough time has elapsed since the last run."
-  (when (or (null llm-buddy--auto-last-run)
-            (>= (float-time (time-subtract (current-time)
-                                           llm-buddy--auto-last-run))
-                llm-buddy-auto-interval))
+  (when (and (>= (float-time (or (current-idle-time) 0))
+                 (if llm-buddy-decision-provider
+                     llm-buddy-decision-idle-delay
+                   llm-buddy-auto-idle-delay))
+             (or (null llm-buddy--auto-last-run)
+                 (>= (float-time (time-subtract (current-time)
+                                                llm-buddy--auto-last-run))
+                     (if llm-buddy-decision-provider
+                         llm-buddy-decision-interval
+                       llm-buddy-auto-interval))))
     (setq llm-buddy--auto-last-run (current-time))
     (llm-buddy-advice)))
 
@@ -327,7 +347,8 @@ Return non-nil on success."
   (when llm-buddy--auto-timer
     (cancel-timer llm-buddy--auto-timer))
   (setq llm-buddy--auto-timer
-        (run-with-idle-timer llm-buddy-auto-idle-delay t
+        (run-with-idle-timer (min llm-buddy-auto-idle-delay
+                                  llm-buddy-decision-idle-delay) t
                              #'llm-buddy--auto-maybe-run))
   (message "llm-buddy started (every %ds, after %ds idle)"
            llm-buddy-auto-interval llm-buddy-auto-idle-delay))
@@ -563,6 +584,16 @@ current state, so the LLM sees only what changed overall."
           (line-number-at-pos (overlay-start ov)))
       (plist-get note :line))))
 
+(defun llm-buddy--note-current-line (note)
+  "Return the current annotated line for NOTE, if available."
+  (when-let* ((overlay (plist-get note :overlay))
+              (buffer (and (overlayp overlay) (overlay-buffer overlay))))
+    (with-current-buffer buffer
+      (save-excursion
+        (goto-char (overlay-start overlay))
+        (buffer-substring-no-properties
+         (line-beginning-position) (line-end-position))))))
+
 (defun llm-buddy--note-scope-key (note)
   "Return NOTE's scope key, deriving it for legacy notes if needed."
   (or (plist-get note :scope-key)
@@ -758,7 +789,9 @@ and MODE is the buffer's major mode when the problem was detected."
     (cancel-timer timer))
   (puthash scope-key
            (run-with-idle-timer
-            llm-buddy-auto-idle-delay nil
+            (if llm-buddy-decision-provider
+                llm-buddy-decision-idle-delay
+              llm-buddy-auto-idle-delay) nil
             #'llm-buddy--note-review-callback scope-key buffer)
            llm-buddy--note-review-timers))
 
@@ -1126,6 +1159,149 @@ ITERATIONS-LEFT bounds the tool-use loop."
        (message "Error starting LLM advice: %s" (error-message-string err))
        (llm-buddy--finish-advice)))))
 
+(defun llm-buddy--replace-trivial-line (buffer-name line-number old-text new-text)
+  "Replace one unchanged line in BUFFER-NAME with NEW-TEXT."
+  (let ((buffer (llm-buddy--find-buffer buffer-name)))
+    (cond
+     ((not (bufferp buffer)) buffer)
+     ((not (and (integerp line-number) (> line-number 0)
+                (stringp old-text) (stringp new-text)
+                (not (string-match-p "\n" new-text))))
+      "Invalid line replacement.")
+     (t
+      (with-current-buffer buffer
+        (if (not (equal (plist-get (llm-buddy--scope) :key)
+                        llm-buddy--active-advice-scope-key))
+            "The buffer is outside the current advice scope."
+          (save-excursion
+            (goto-char (point-min))
+            (forward-line (1- line-number))
+            (if (or (/= (line-number-at-pos) line-number)
+                    (not (equal old-text
+                                (buffer-substring-no-properties
+                                 (line-beginning-position) (line-end-position)))))
+                "The line changed; no fix was applied."
+              (delete-region (line-beginning-position) (line-end-position))
+              (insert new-text)
+              "Fix applied."))))))))
+
+(defconst llm-buddy-tool-replace-trivial-line
+  (make-llm-tool
+   :function #'llm-buddy--replace-trivial-line
+   :name "replace_trivial_line"
+   :description "Replace a line containing a clear trivial problem, if its current text still matches old_text."
+   :args '((:name "buffer_name" :type string :required t)
+           (:name "line_number" :type integer :required t)
+           (:name "old_text" :type string :required t)
+           (:name "new_text" :type string :required t))))
+
+(defun llm-buddy--start-trivial-fix (key changes diff reviewed-through)
+  "Ask the chat provider to fix a trivial problem in DIFF."
+  (run-hook-with-args 'llm-buddy-advice-start-functions key changes diff)
+  (condition-case err
+      (llm-chat-async
+       llm-buddy-provider
+       (llm-make-chat-prompt
+        diff
+        :context "Fix only clear, trivial mistakes in the added lines of this diff, such as typos.  Call replace_trivial_line with the complete current line and corrected line.  Do not change incomplete text near the cursor or make speculative edits.  If a safe fix is not possible, make no tool call."
+        :tools (list llm-buddy-tool-read-buffer
+                     llm-buddy-tool-replace-trivial-line))
+       (lambda (response)
+         (run-hook-with-args 'llm-buddy-advice-response-functions key response)
+         (llm-buddy--finish-advice reviewed-through))
+       (lambda (_ error-message)
+         (message "Error fixing trivial problem: %s" error-message)
+         (llm-buddy--finish-advice)))
+    (error
+     (message "Error starting trivial fix: %s" (error-message-string err))
+     (llm-buddy--finish-advice))))
+
+(defun llm-buddy--start-chat-advice (key changes diff reviewed-through)
+  "Start full chat review for CHANGES and DIFF in KEY."
+  (let* ((formatted (concat diff (llm-buddy--format-notes key)))
+         (prompt (llm-make-chat-prompt
+                  formatted
+                  :context (llm-buddy--instructions)
+                  :tools (list llm-buddy-tool-read-buffer
+                               llm-buddy-tool-note
+                               llm-buddy-tool-remove-note
+                               llm-buddy-tool-update-note
+                               llm-buddy-tool-end)
+                  :tool-options (make-llm-tool-options :tool-choice 'any))))
+    (run-hook-with-args
+     'llm-buddy-advice-start-functions key changes formatted)
+    (llm-buddy--iterate key prompt reviewed-through llm-buddy-max-iterations)))
+
+(defun llm-buddy--decision-questions (notes)
+  "Return diff and edited-NOTES questions for one decision call."
+  (cons
+   (make-llm-question-choice
+    :name 'diff_severity
+    :instructions "Does the added text contain a clear, real problem?  Ignore incomplete work near the cursor and speculative concerns.  Choose the highest severity found."
+    :choices '((none . "No clear problem")
+               (trivial . "A typo, wording, or similarly minor mistake")
+               (significant . "A real mistake affecting the intended result")
+               (critical . "A serious mistake with major consequences")))
+   (mapcar
+    (lambda (note)
+      (make-llm-question-choice
+       :name (intern (format "note_%d_corrected" (plist-get note :id)))
+       :instructions
+       (format "Note %d at %s:%d says: %s.  Current annotated line: %s.  Compare the note and current line with the diff.  Old - lines are removed; + lines are current.  Is the specific problem described by the note still present?"
+               (plist-get note :id) (plist-get note :buffer)
+               (llm-buddy--note-line note) (plist-get note :note)
+               (or (llm-buddy--note-current-line note) "(unavailable)"))
+       :choices '((corrected . "The noted problem is gone from current text")
+                  (remaining . "The same noted problem is still present")
+                  (uncertain . "Cannot tell from the current text and diff"))))
+    notes)))
+
+(defun llm-buddy--handle-decision
+    (result key changes diff notes reviewed-through)
+  "Act on RESULT for DIFF and edited NOTES in KEY."
+  (dolist (note notes)
+    (let ((answer (alist-get
+                   (intern (format "note_%d_corrected" (plist-get note :id)))
+                   result)))
+      (when (and (eq (plist-get note :status) 'active)
+                 (llm-decision-choice-p answer)
+                 (eq (llm-decision-choice-choice answer) 'corrected)
+                 (> (llm-decision-choice-confidence answer) 0.5)
+                 (not (time-less-p reviewed-through
+                                   (plist-get note :edited-time))))
+        (llm-buddy--dismiss-note-record note "corrected after edit"))))
+  (let* ((answer (alist-get 'diff_severity result))
+         (severity (when (llm-decision-choice-p answer)
+                     (llm-decision-choice-choice answer))))
+    (pcase severity
+      ('none (llm-buddy--finish-advice reviewed-through))
+      ('trivial (llm-buddy--start-trivial-fix
+                 key changes diff reviewed-through))
+      ((or 'significant 'critical)
+       (llm-buddy--start-chat-advice key changes diff reviewed-through))
+      (_ (llm-buddy--start-chat-advice key changes diff reviewed-through)))))
+
+(defun llm-buddy--start-decision (key changes diff reviewed-through)
+  "Classify DIFF and edited notes in one asynchronous call."
+  (let ((notes (cl-remove-if-not
+                (lambda (note)
+                  (and (eq (plist-get note :status) 'active)
+                       (plist-get note :review-needed)))
+                (llm-buddy--notes-for-scope key))))
+    (condition-case err
+        (llm-decide-async
+         llm-buddy-decision-provider
+         (llm-buddy--decision-questions notes) diff
+         (lambda (result)
+           (llm-buddy--handle-decision
+            result key changes diff notes reviewed-through))
+         (lambda (_ error-message)
+           (message "Decision failed: %s" error-message)
+           (llm-buddy--start-chat-advice key changes diff reviewed-through)))
+      (error
+       (message "Error starting decision: %s" (error-message-string err))
+       (llm-buddy--start-chat-advice key changes diff reviewed-through)))))
+
 (defun llm-buddy-advice ()
   "Provide feedback on recent changes in all tracked buffers.
 
@@ -1141,8 +1317,7 @@ The output is added as overlay text in the relevant buffer."
            (reviewed-through (current-time))
            (changes (llm-buddy--reviewable-changes-since
                      last-advice-time key))
-           (diff-formatted (llm-buddy-format-diff changes))
-           (formatted (concat diff-formatted (llm-buddy--format-notes key))))
+           (diff-formatted (llm-buddy-format-diff changes)))
       (cond
        ((null changes) t)
        ((string-empty-p diff-formatted)
@@ -1151,24 +1326,12 @@ The output is added as overlay text in the relevant buffer."
        (t
         (unless llm-buddy-provider
           (user-error "No LLM provider configured; set `llm-buddy-provider'"))
-        (let* ((buffers (seq-uniq (mapcar (lambda (change)
-                                            (plist-get change :buffer))
-                                          changes)))
-               (prompt (llm-make-chat-prompt
-                        formatted
-                        :context (llm-buddy--instructions)
-                        :tools (list llm-buddy-tool-read-buffer
-                                     llm-buddy-tool-note
-                                     llm-buddy-tool-remove-note
-                                     llm-buddy-tool-update-note
-                                     llm-buddy-tool-end)
-                        :tool-options (make-llm-tool-options :tool-choice 'any))))
-          (run-hook-with-args
-           'llm-buddy-advice-start-functions key changes formatted)
-          (setq llm-buddy--active-advice-scope-key key)
-          (setq llm-buddy--advice-running t)
-          (llm-buddy--iterate key prompt reviewed-through
-                              llm-buddy-max-iterations)))))))
+        (setq llm-buddy--active-advice-scope-key key)
+        (setq llm-buddy--advice-running t)
+        (if llm-buddy-decision-provider
+            (llm-buddy--start-decision key changes diff-formatted reviewed-through)
+          (llm-buddy--start-chat-advice
+           key changes diff-formatted reviewed-through)))))))
 
 
 (provide 'llm-buddy)
