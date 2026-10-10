@@ -88,6 +88,9 @@ This bounds provider or prompt failures where the model never calls the
 (defconst llm-buddy--severities '(trivial significant critical)
   "List of severities, in order of increasing severity.")
 
+(defconst llm-buddy--decision-min-confidence 0.8
+  "Minimum confidence for skipping full chat review after a decision.")
+
 (defun llm-buddy--severity-to-idx (severity)
   "Convert SEVERITY symbol to an index."
   (seq-position llm-buddy--severities severity))
@@ -350,8 +353,13 @@ Return non-nil on success."
         (run-with-idle-timer (min llm-buddy-auto-idle-delay
                                   llm-buddy-decision-idle-delay) t
                                   #'llm-buddy--auto-maybe-run))
-  (message "llm-buddy started (every %ds, after %ds idle)"
-           llm-buddy-auto-interval llm-buddy-auto-idle-delay))
+  (message "llm-buddy started (every %ss, after %ss idle)"
+           (if llm-buddy-decision-provider
+               llm-buddy-decision-interval
+             llm-buddy-auto-interval)
+           (if llm-buddy-decision-provider
+               llm-buddy-decision-idle-delay
+             llm-buddy-auto-idle-delay)))
 
 (defun llm-buddy--stop-auto-timer ()
   "Stop the automatic advice idle timer."
@@ -1195,9 +1203,8 @@ ITERATIONS-LEFT bounds the tool-use loop."
            (:name "old_text" :type string :required t)
            (:name "new_text" :type string :required t))))
 
-(defun llm-buddy--start-trivial-fix (key changes diff reviewed-through)
+(defun llm-buddy--start-trivial-fix (key diff reviewed-through)
   "Ask the chat provider to fix a trivial problem in DIFF."
-  (run-hook-with-args 'llm-buddy-advice-start-functions key changes diff)
   (condition-case err
       (llm-chat-async
        llm-buddy-provider
@@ -1216,8 +1223,8 @@ ITERATIONS-LEFT bounds the tool-use loop."
      (message "Error starting trivial fix: %s" (error-message-string err))
      (llm-buddy--finish-advice))))
 
-(defun llm-buddy--start-chat-advice (key changes diff reviewed-through)
-  "Start full chat review for CHANGES and DIFF in KEY."
+(defun llm-buddy--start-chat-advice (key diff reviewed-through)
+  "Start full chat review for DIFF in KEY."
   (let* ((formatted (concat diff (llm-buddy--format-notes key)))
          (prompt (llm-make-chat-prompt
                   formatted
@@ -1228,8 +1235,6 @@ ITERATIONS-LEFT bounds the tool-use loop."
                                llm-buddy-tool-update-note
                                llm-buddy-tool-end)
                   :tool-options (make-llm-tool-options :tool-choice 'any))))
-    (run-hook-with-args
-     'llm-buddy-advice-start-functions key changes formatted)
     (llm-buddy--iterate key prompt reviewed-through llm-buddy-max-iterations)))
 
 (defun llm-buddy--decision-questions (notes)
@@ -1257,7 +1262,7 @@ ITERATIONS-LEFT bounds the tool-use loop."
     notes)))
 
 (defun llm-buddy--handle-decision
-    (result key changes diff notes reviewed-through)
+    (result key diff notes reviewed-through)
   "Act on RESULT for DIFF and edited NOTES in KEY."
   (dolist (note notes)
     (let ((answer (alist-get
@@ -1272,16 +1277,26 @@ ITERATIONS-LEFT bounds the tool-use loop."
         (llm-buddy--dismiss-note-record note "corrected after edit"))))
   (let* ((answer (alist-get 'diff_severity result))
          (severity (when (llm-decision-choice-p answer)
-                     (llm-decision-choice-choice answer))))
+                     (llm-decision-choice-choice answer)))
+         (confidence (when (llm-decision-choice-p answer)
+                       (llm-decision-choice-confidence answer))))
     (pcase severity
-      ('none (llm-buddy--finish-advice reviewed-through))
-      ('trivial (llm-buddy--start-trivial-fix
-                 key changes diff reviewed-through))
+      ('none (if (and (numberp confidence)
+                      (>= confidence llm-buddy--decision-min-confidence))
+               (llm-buddy--finish-advice reviewed-through)
+               (llm-buddy--start-chat-advice
+                key diff reviewed-through)))
+      ('trivial (if (and (numberp confidence)
+                         (>= confidence llm-buddy--decision-min-confidence))
+                    (llm-buddy--start-trivial-fix
+                     key diff reviewed-through)
+                  (llm-buddy--start-chat-advice
+                   key diff reviewed-through)))
       ((or 'significant 'critical)
-       (llm-buddy--start-chat-advice key changes diff reviewed-through))
-      (_ (llm-buddy--start-chat-advice key changes diff reviewed-through)))))
+       (llm-buddy--start-chat-advice key diff reviewed-through))
+      (_ (llm-buddy--start-chat-advice key diff reviewed-through)))))
 
-(defun llm-buddy--start-decision (key changes diff reviewed-through)
+(defun llm-buddy--start-decision (key diff reviewed-through)
   "Classify DIFF and edited notes in one asynchronous call."
   (let ((notes (cl-remove-if-not
                 (lambda (note)
@@ -1294,13 +1309,13 @@ ITERATIONS-LEFT bounds the tool-use loop."
          (llm-buddy--decision-questions notes) diff
          (lambda (result)
            (llm-buddy--handle-decision
-            result key changes diff notes reviewed-through))
+            result key diff notes reviewed-through))
          (lambda (_ error-message)
            (message "Decision failed: %s" error-message)
-           (llm-buddy--start-chat-advice key changes diff reviewed-through)))
+           (llm-buddy--start-chat-advice key diff reviewed-through)))
       (error
        (message "Error starting decision: %s" (error-message-string err))
-       (llm-buddy--start-chat-advice key changes diff reviewed-through)))))
+       (llm-buddy--start-chat-advice key diff reviewed-through)))))
 
 (defun llm-buddy-advice ()
   "Provide feedback on recent changes in all tracked buffers.
@@ -1326,12 +1341,15 @@ The output is added as overlay text in the relevant buffer."
        (t
         (unless llm-buddy-provider
           (user-error "No LLM provider configured; set `llm-buddy-provider'"))
+        (run-hook-with-args
+         'llm-buddy-advice-start-functions key changes
+         (concat diff-formatted (llm-buddy--format-notes key)))
         (setq llm-buddy--active-advice-scope-key key)
         (setq llm-buddy--advice-running t)
         (if llm-buddy-decision-provider
-            (llm-buddy--start-decision key changes diff-formatted reviewed-through)
+            (llm-buddy--start-decision key diff-formatted reviewed-through)
           (llm-buddy--start-chat-advice
-           key changes diff-formatted reviewed-through)))))))
+           key diff-formatted reviewed-through)))))))
 
 
 (provide 'llm-buddy)
