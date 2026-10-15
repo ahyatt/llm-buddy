@@ -290,7 +290,8 @@ Return non-nil on success."
                                :old-text old-text
                                :new-text new-text)
                          (gethash key llm-buddy-change-history))
-                   llm-buddy-change-history))))))
+                   llm-buddy-change-history)))
+      (llm-buddy--mark-scope-notes-for-review key (current-buffer)))))
 
 (defun llm-buddy--record-current-buffer ()
   "Begin recording changes in the current buffer."
@@ -319,7 +320,7 @@ Return non-nil on success."
       (llm-buddy--stop-recording-current-buffer))))
 
 (defvar llm-buddy--auto-timer nil
-  "Idle timer for automatic advice, or nil when not running.")
+  "Polling timer for automatic advice, or nil when not running.")
 
 (defvar llm-buddy--auto-last-run nil
   "Time of the last automatic advice run, or nil.")
@@ -332,7 +333,8 @@ Return non-nil on success."
 
 (defun llm-buddy--auto-maybe-run ()
   "Run `llm-buddy-advice' if enough time has elapsed since the last run."
-  (when (and (>= (float-time (or (current-idle-time) 0))
+  (when (and (not llm-buddy--advice-running)
+             (>= (float-time (or (current-idle-time) 0))
                  (if llm-buddy-decision-provider
                      llm-buddy-decision-idle-delay
                    llm-buddy-auto-idle-delay))
@@ -346,13 +348,15 @@ Return non-nil on success."
     (llm-buddy-advice)))
 
 (defun llm-buddy--start-auto-timer ()
-  "Start the automatic advice idle timer."
+  "Start polling for automatic advice while Emacs is idle.
+A repeating idle timer fires only once per idle period, which can lose
+a review when the minimum interval has not elapsed yet."
   (when llm-buddy--auto-timer
     (cancel-timer llm-buddy--auto-timer))
   (setq llm-buddy--auto-timer
-        (run-with-idle-timer (min llm-buddy-auto-idle-delay
-                                  llm-buddy-decision-idle-delay) t
-                                  #'llm-buddy--auto-maybe-run))
+        (run-with-timer 0 (max 0.1 (min llm-buddy-auto-idle-delay
+                                       llm-buddy-decision-idle-delay))
+                        #'llm-buddy--auto-maybe-run))
   (message "llm-buddy started (every %ss, after %ss idle)"
            (if llm-buddy-decision-provider
                llm-buddy-decision-interval
@@ -782,11 +786,35 @@ and MODE is the buffer's major mode when the problem was detected."
                                  (plist-get note :edited-time))))
       (setf (plist-get note :review-needed) nil))))
 
+(defun llm-buddy--pending-notes (scope-key)
+  "Return active notes awaiting review in SCOPE-KEY."
+  (cl-remove-if-not
+   (lambda (note)
+     (and (eq (plist-get note :status) 'active)
+          (plist-get note :review-needed)))
+   (llm-buddy--notes-for-scope scope-key)))
+
+(defun llm-buddy--mark-scope-notes-for-review (scope-key buffer)
+  "Queue active notes in SCOPE-KEY after a change in BUFFER.
+A correction may occur outside the annotated line or in another buffer."
+  (let ((now (current-time)) (pending nil))
+    (dolist (note (llm-buddy--notes-for-scope scope-key))
+      (when (eq (plist-get note :status) 'active)
+        (setf (plist-get note :edited-time) now
+              (plist-get note :review-needed) t)
+        (setq pending t)))
+    (when pending
+      (llm-buddy--schedule-note-review scope-key buffer))))
+
 (defun llm-buddy--note-review-callback (scope-key buffer)
   "Run advice for SCOPE-KEY in BUFFER after the user stops typing."
   (remhash scope-key llm-buddy--note-review-timers)
   (when (buffer-live-p buffer)
-    (if llm-buddy--advice-running
+    (if (or llm-buddy--advice-running
+            (< (float-time (or (current-idle-time) 0))
+               (if llm-buddy-decision-provider
+                   llm-buddy-decision-idle-delay
+                 llm-buddy-auto-idle-delay)))
         (llm-buddy--schedule-note-review scope-key buffer)
       (with-current-buffer buffer
         (llm-buddy-advice)))))
@@ -796,7 +824,7 @@ and MODE is the buffer's major mode when the problem was detected."
   (when-let* ((timer (gethash scope-key llm-buddy--note-review-timers)))
     (cancel-timer timer))
   (puthash scope-key
-           (run-with-idle-timer
+           (run-with-timer
             (if llm-buddy-decision-provider
                 llm-buddy-decision-idle-delay
               llm-buddy-auto-idle-delay) nil
@@ -826,7 +854,7 @@ When SCOPE-KEY is nil, use the current buffer's scope."
                       (format " (dismissed: %s)"
                               (or (plist-get note :dismissed-reason) "unknown")))
                      ((plist-get note :review-needed)
-                      " (the annotated line changed since this note was added or updated; decide whether to remove_note or update_note)")
+                      " (this scope changed since this note was last reviewed; decide whether to remove_note, update_note, or keep it)")
                      (t "")))))
         notes
         "\n")))))
@@ -1014,7 +1042,7 @@ we will attempt to fix it if `llm-buddy-fix-unreported' is non-nil."
         (delete-overlay ov))))
   (setq llm-buddy--note-overlays nil))
 
-(defun llm-buddy--read-buffer (buffer-name &optional begin end)
+(cl-defun llm-buddy--read-buffer (buffer-name &optional begin end)
   "Read BUFFER-NAME and return its contents with line numbers.
 BEGIN and END optionally restrict to a line range.
 When BUFFER-NAME does not match exactly but multiple buffers share
@@ -1110,13 +1138,13 @@ call and its result.")
     (concat
      "You are a helpful assistant running in Emacs.  As the user goes about their work, you observe the changes they make to their files.  The changes you see may span multiple changed buffers." proj-info "  You will provide feedback on recent changes in tracked buffers, including suggestions for improvement or correction.  You only comment on things that could be improved, and you never say anything if there is nothing worth remarking about.
 
-The diff headers show where the user's cursor currently is.  The cursor position indicates what the user is actively working on.  Do not comment on incomplete code near the cursor -- the user is still typing.  Only comment on code that appears to be finished, such as completed statements or blocks that the user has moved past.
+The diff headers show where the user's cursor currently is.  The cursor position indicates what the user is actively working on.  Do not comment on unfinished expressions near the cursor -- the user is still typing.  A syntactically complete expression can be reviewed even on the cursor line.  In particular, a closed function call missing a required argument is a real problem, not unfinished typing.
 
 Only note real problems, not hypothetical ones.  So, for example, note that there's a typo, a bug, or a bad idea, but if you see something and wonder if it is correct, but have no evidence to the contrary, ignore it.  Remember that you do not have access to the latest information about the world, so do not try to speculate about the correctness about external facts that seem recent and beyond your range of knowledge.
 
 You have access to tools that allow you to read buffers.  The diffs you receive are in unified diff format, with @@ headers showing line numbers.  Diff context and added lines are prefixed with the current buffer line number to use with add_note.  Lines prefixed with \"old\" are removed text and are not in the current buffer; do not add notes for problems that only appear in old removed text.  Use the read_buffer tool if you need more context around a change.
 
-To make a note about part of the code, call the add_note tool with the buffer name and line number.  It will result in an Emacs buffer overlay with your note on it.  The tool result includes the note_id.  If an active previous note is no longer useful, or any previous note seems no longer relevant, call remove_note with its note_id.  If an active previous note is still useful but its text is no longer accurate, call update_note with its note_id and replacement note text.  Previous notes can be marked to show that the annotated line changed since the note was added or updated; for those notes, use the diff and read_buffer as needed to decide whether the note should be removed, updated, or left alone.  You can add, update, or remove notes as many times as you need to.  When there is nothing left to say, call the end tool.
+To make a note about part of the code, call the add_note tool with the buffer name and line number.  It will result in an Emacs buffer overlay with your note on it.  The tool result includes the note_id.  If an active previous note is no longer useful, or any previous note seems no longer relevant, call remove_note with its note_id.  If an active previous note is still useful but its text is no longer accurate, call update_note with its note_id and replacement note text.  Previous notes can be marked to show that the review scope changed since the note was last reviewed; for those notes, use the diff and read_buffer as needed to decide whether the note should be removed, updated, or left alone.  You can add, update, or remove notes as many times as you need to.  When there is nothing left to say, call the end tool.
 
 The current review is scoped to either the current project or the current non-project buffer.  Only add notes to buffers shown in this review scope.
 
@@ -1238,15 +1266,22 @@ ITERATIONS-LEFT bounds the tool-use loop."
     (llm-buddy--iterate key prompt reviewed-through llm-buddy-max-iterations)))
 
 (defun llm-buddy--decision-questions (notes)
-  "Return diff and edited-NOTES questions for one decision call."
-  (cons
-   (make-llm-question-choice
-    :name 'diff_severity
-    :instructions "Does the added text contain a clear, real problem?  Ignore incomplete work near the cursor and speculative concerns.  Choose the highest severity found."
-    :choices '((none . "No clear problem")
-               (trivial . "A typo, wording, or similarly minor mistake")
-               (significant . "A real mistake affecting the intended result")
-               (critical . "A serious mistake with major consequences")))
+  "Return editing, severity, and edited-NOTES questions for one call."
+  (append
+   (list
+    (make-llm-question-choice
+     :name 'diff_editing_state
+     :instructions "Does the changed text look unfinished because the user is still composing it?  Judge the changed text, especially near the cursor.  A closed expression is complete even on the cursor line; a definite error in it does not mean it is still being edited."
+     :choices '((in_progress . "The changed text is visibly unfinished")
+                (finished . "The changed text is complete enough to review")
+                (uncertain . "The diff does not show whether it is finished")))
+    (make-llm-question-choice
+     :name 'diff_severity
+     :instructions "If the changed text is complete enough to review, does it contain a clear, real problem?  Check completed function calls for missing required arguments and other definite errors.  A closed expression is eligible for review even on the cursor line.  Ignore speculative concerns.  Choose the highest severity found."
+     :choices '((none . "No clear problem")
+                (trivial . "A typo, wording, or similarly minor mistake")
+                (significant . "A real mistake affecting the intended result")
+                (critical . "A serious mistake with major consequences"))))
    (mapcar
     (lambda (note)
       (make-llm-question-choice
@@ -1264,45 +1299,66 @@ ITERATIONS-LEFT bounds the tool-use loop."
 (defun llm-buddy--handle-decision
     (result key diff notes reviewed-through)
   "Act on RESULT for DIFF and edited NOTES in KEY."
-  (dolist (note notes)
-    (let ((answer (alist-get
-                   (intern (format "note_%d_corrected" (plist-get note :id)))
-                   result)))
-      (when (and (eq (plist-get note :status) 'active)
-                 (llm-decision-choice-p answer)
-                 (eq (llm-decision-choice-choice answer) 'corrected)
-                 (> (llm-decision-choice-confidence answer) 0.5)
-                 (not (time-less-p reviewed-through
-                                   (plist-get note :edited-time))))
-        (llm-buddy--dismiss-note-record note "corrected after edit"))))
-  (let* ((answer (alist-get 'diff_severity result))
-         (severity (when (llm-decision-choice-p answer)
-                     (llm-decision-choice-choice answer)))
-         (confidence (when (llm-decision-choice-p answer)
-                       (llm-decision-choice-confidence answer))))
-    (pcase severity
-      ('none (if (and (numberp confidence)
-                      (>= confidence llm-buddy--decision-min-confidence))
-               (llm-buddy--finish-advice reviewed-through)
-               (llm-buddy--start-chat-advice
-                key diff reviewed-through)))
-      ('trivial (if (and (numberp confidence)
-                         (>= confidence llm-buddy--decision-min-confidence))
-                    (llm-buddy--start-trivial-fix
-                     key diff reviewed-through)
-                  (llm-buddy--start-chat-advice
-                   key diff reviewed-through)))
-      ((or 'significant 'critical)
-       (llm-buddy--start-chat-advice key diff reviewed-through))
-      (_ (llm-buddy--start-chat-advice key diff reviewed-through)))))
+  (let ((unresolved nil))
+    (dolist (note notes)
+      (let* ((answer (alist-get
+                      (intern (format "note_%d_corrected" (plist-get note :id)))
+                      result))
+             (choice (when (llm-decision-choice-p answer)
+                       (llm-decision-choice-choice answer)))
+             (confidence (when (llm-decision-choice-p answer)
+                           (llm-decision-choice-confidence answer))))
+        (when (and (eq (plist-get note :status) 'active)
+                   (not (time-less-p reviewed-through
+                                     (plist-get note :edited-time))))
+          (cond
+           ((and (memq choice '(corrected remaining))
+                 (numberp confidence)
+                 (>= confidence llm-buddy--decision-min-confidence))
+            (if (eq choice 'corrected)
+                (llm-buddy--dismiss-note-record note "corrected after edit")
+              (setf (plist-get note :review-needed) nil)))
+           (t (setq unresolved t))))))
+    (let* ((editing-answer (alist-get 'diff_editing_state result))
+           (editing-choice (when (llm-decision-choice-p editing-answer)
+                             (llm-decision-choice-choice editing-answer)))
+           (editing-confidence (when (llm-decision-choice-p editing-answer)
+                                 (llm-decision-choice-confidence editing-answer)))
+           (editing-confident (and (numberp editing-confidence)
+                                   (>= editing-confidence
+                                       llm-buddy--decision-min-confidence)))
+           (answer (alist-get 'diff_severity result))
+           (severity (when (llm-decision-choice-p answer)
+                       (llm-decision-choice-choice answer)))
+           (confidence (when (llm-decision-choice-p answer)
+                         (llm-decision-choice-confidence answer))))
+      (pcase (cond
+              ((and editing-confident (eq editing-choice 'in_progress))
+               'in_progress)
+              ((and editing-confident (eq editing-choice 'finished)
+                    (not unresolved))
+               severity)
+              (t 'needs-chat-review))
+        ('in_progress
+         (llm-buddy--finish-advice (unless unresolved reviewed-through)))
+        ('none (if (and (numberp confidence)
+                        (>= confidence llm-buddy--decision-min-confidence))
+                   (llm-buddy--finish-advice reviewed-through)
+                 (llm-buddy--start-chat-advice
+                  key diff reviewed-through)))
+        ('trivial (if (and (numberp confidence)
+                           (>= confidence llm-buddy--decision-min-confidence))
+                      (llm-buddy--start-trivial-fix
+                       key diff reviewed-through)
+                    (llm-buddy--start-chat-advice
+                     key diff reviewed-through)))
+        ((or 'significant 'critical)
+         (llm-buddy--start-chat-advice key diff reviewed-through))
+        (_ (llm-buddy--start-chat-advice key diff reviewed-through))))))
 
 (defun llm-buddy--start-decision (key diff reviewed-through)
   "Classify DIFF and edited notes in one asynchronous call."
-  (let ((notes (cl-remove-if-not
-                (lambda (note)
-                  (and (eq (plist-get note :status) 'active)
-                       (plist-get note :review-needed)))
-                (llm-buddy--notes-for-scope key))))
+  (let ((notes (llm-buddy--pending-notes key)))
     (condition-case err
         (llm-decide-async
          llm-buddy-decision-provider
@@ -1332,10 +1388,11 @@ The output is added as overlay text in the relevant buffer."
            (reviewed-through (current-time))
            (changes (llm-buddy--reviewable-changes-since
                      last-advice-time key))
-           (diff-formatted (llm-buddy-format-diff changes)))
+           (diff-formatted (llm-buddy-format-diff changes))
+           (pending-notes (llm-buddy--pending-notes key)))
       (cond
-       ((null changes) t)
-       ((string-empty-p diff-formatted)
+       ((and (null changes) (null pending-notes)) t)
+       ((and (string-empty-p diff-formatted) (null pending-notes))
         (puthash key reviewed-through llm-buddy--last-advice-times)
         (setq llm-buddy--last-advice-time reviewed-through))
        (t
