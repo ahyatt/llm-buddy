@@ -6,7 +6,7 @@
 ;; Homepage: https://github.com/ahyatt/llm-buddy
 ;; Package-Requires: ((emacs "28.1") (llm "0.33.0"))
 ;; Keywords: convenience, tools
-;; Version: 0.1.0
+;; Version: 0.2.0
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 ;;
 ;; This program is free software; you can redistribute it and/or
@@ -368,7 +368,7 @@ a review when the minimum interval has not elapsed yet."
     (cancel-timer llm-buddy--auto-timer))
   (setq llm-buddy--auto-timer
         (run-with-timer 0 (max 0.1 (min llm-buddy-auto-idle-delay
-                                       llm-buddy-decision-idle-delay))
+                                        llm-buddy-decision-idle-delay))
                         #'llm-buddy--auto-maybe-run))
   (message "llm-buddy started (every %ss, after %ss idle)"
            (if llm-buddy-decision-provider
@@ -1186,7 +1186,7 @@ reviewed note flags without marking the diff as reviewed."
   (run-hooks 'llm-buddy-advice-done-hook))
 
 (defun llm-buddy--iterate (key prompt reviewed-through iterations-left
-                              &optional notes-only)
+                               &optional notes-only)
   "Iterate on PROMPT for KEY, updating it in place.
 REVIEWED-THROUGH is recorded only if the model calls `end'.
 ITERATIONS-LEFT bounds the tool-use loop.  NOTES-ONLY preserves the
