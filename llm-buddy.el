@@ -65,7 +65,14 @@ otherwise it starts a new chunk."
   :group 'llm-buddy)
 
 (defcustom llm-buddy-decision-idle-delay 0.5
-  "Idle seconds before checking changes with a decision provider."
+  "Idle seconds before checking existing notes with a decision provider."
+  :type 'number
+  :group 'llm-buddy)
+
+(defcustom llm-buddy-feedback-idle-delay 3
+  "Idle seconds before decision-based review can create new feedback.
+Existing notes can be checked sooner using
+`llm-buddy-decision-idle-delay'."
   :type 'number
   :group 'llm-buddy)
 
@@ -89,7 +96,7 @@ This bounds provider or prompt failures where the model never calls the
   "List of severities, in order of increasing severity.")
 
 (defconst llm-buddy--decision-min-confidence 0.8
-  "Minimum confidence for skipping full chat review after a decision.")
+  "Minimum confidence for trusting a decision result.")
 
 (defun llm-buddy--severity-to-idx (severity)
   "Convert SEVERITY symbol to an index."
@@ -331,12 +338,18 @@ Return non-nil on success."
 (defvar llm-buddy--fix-timers (make-hash-table :test 'equal)
   "Hash table mapping buffer and line keys to pending automatic fixes.")
 
+(defun llm-buddy--feedback-ready-p ()
+  "Return non-nil when Emacs has been idle long enough for new feedback."
+  (>= (float-time (or (current-idle-time) 0))
+      (max llm-buddy-decision-idle-delay llm-buddy-feedback-idle-delay)))
+
 (defun llm-buddy--auto-maybe-run ()
   "Run `llm-buddy-advice' if enough time has elapsed since the last run."
   (when (and (not llm-buddy--advice-running)
              (>= (float-time (or (current-idle-time) 0))
                  (if llm-buddy-decision-provider
-                     llm-buddy-decision-idle-delay
+                     (max llm-buddy-decision-idle-delay
+                          llm-buddy-feedback-idle-delay)
                    llm-buddy-auto-idle-delay))
              (or (null llm-buddy--auto-last-run)
                  (>= (float-time (time-subtract (current-time)
@@ -362,7 +375,8 @@ a review when the minimum interval has not elapsed yet."
                llm-buddy-decision-interval
              llm-buddy-auto-interval)
            (if llm-buddy-decision-provider
-               llm-buddy-decision-idle-delay
+               (max llm-buddy-decision-idle-delay
+                    llm-buddy-feedback-idle-delay)
              llm-buddy-auto-idle-delay)))
 
 (defun llm-buddy--stop-auto-timer ()
@@ -1138,7 +1152,7 @@ call and its result.")
     (concat
      "You are a helpful assistant running in Emacs.  As the user goes about their work, you observe the changes they make to their files.  The changes you see may span multiple changed buffers." proj-info "  You will provide feedback on recent changes in tracked buffers, including suggestions for improvement or correction.  You only comment on things that could be improved, and you never say anything if there is nothing worth remarking about.
 
-The diff headers show where the user's cursor currently is.  The cursor position indicates what the user is actively working on.  Do not comment on unfinished expressions near the cursor -- the user is still typing.  A syntactically complete expression can be reviewed even on the cursor line.  In particular, a closed function call missing a required argument is a real problem, not unfinished typing.
+The diff headers show where the user's cursor currently is.  The cursor position indicates what the user is actively working on.  Defer feedback on text that the user appears to be composing or revising near the cursor.  Balanced parentheses or a closed expression alone do not establish that editing is finished.
 
 Only note real problems, not hypothetical ones.  So, for example, note that there's a typo, a bug, or a bad idea, but if you see something and wonder if it is correct, but have no evidence to the contrary, ignore it.  Remember that you do not have access to the latest information about the world, so do not try to speculate about the correctness about external facts that seem recent and beyond your range of knowledge.
 
@@ -1153,25 +1167,30 @@ The user may make changes, and you will have the chance to comment on those chan
 (defvar llm-buddy-advice-done-hook nil
   "Hook run after `llm-buddy-advice' has finished its iteration.")
 
-(defun llm-buddy--finish-advice (&optional reviewed-through)
+(defun llm-buddy--finish-advice (&optional reviewed-through notes-only)
   "Finish the current advice run.
 When REVIEWED-THROUGH is non-nil, record that changes through that
-time were reviewed successfully."
+time were reviewed successfully.  When NOTES-ONLY is non-nil, clear
+reviewed note flags without marking the diff as reviewed."
   (when reviewed-through
-    (setq llm-buddy--last-advice-time reviewed-through)
+    (unless notes-only
+      (setq llm-buddy--last-advice-time reviewed-through))
     (when llm-buddy--active-advice-scope-key
       (llm-buddy--clear-reviewed-note-flags
        llm-buddy--active-advice-scope-key reviewed-through)
-      (puthash llm-buddy--active-advice-scope-key reviewed-through
-               llm-buddy--last-advice-times)))
+      (unless notes-only
+        (puthash llm-buddy--active-advice-scope-key reviewed-through
+                 llm-buddy--last-advice-times))))
   (setq llm-buddy--active-advice-scope-key nil)
   (setq llm-buddy--advice-running nil)
   (run-hooks 'llm-buddy-advice-done-hook))
 
-(defun llm-buddy--iterate (key prompt reviewed-through iterations-left)
+(defun llm-buddy--iterate (key prompt reviewed-through iterations-left
+                              &optional notes-only)
   "Iterate on PROMPT for KEY, updating it in place.
 REVIEWED-THROUGH is recorded only if the model calls `end'.
-ITERATIONS-LEFT bounds the tool-use loop."
+ITERATIONS-LEFT bounds the tool-use loop.  NOTES-ONLY preserves the
+diff for a later review."
   (if (<= iterations-left 0)
       (progn
         (message "llm-buddy stopped: model did not call end within %d iterations"
@@ -1184,9 +1203,9 @@ ITERATIONS-LEFT bounds the tool-use loop."
                           (run-hook-with-args
                            'llm-buddy-advice-response-functions key response)
                           (if (assoc "end" (plist-get response :tool-results))
-                              (llm-buddy--finish-advice reviewed-through)
+                              (llm-buddy--finish-advice reviewed-through notes-only)
                             (llm-buddy--iterate key prompt reviewed-through
-                                                (1- iterations-left))))
+                                                (1- iterations-left) notes-only)))
                         (lambda (_ err)
                           (message "Error getting LLM advice: %s" (or err "unknown error"))
                           (llm-buddy--finish-advice))
@@ -1251,19 +1270,24 @@ ITERATIONS-LEFT bounds the tool-use loop."
      (message "Error starting trivial fix: %s" (error-message-string err))
      (llm-buddy--finish-advice))))
 
-(defun llm-buddy--start-chat-advice (key diff reviewed-through)
-  "Start full chat review for DIFF in KEY."
+(defun llm-buddy--start-chat-advice (key diff reviewed-through &optional notes-only)
+  "Start chat review for DIFF in KEY.
+When NOTES-ONLY is non-nil, allow only existing-note review and
+preserve the diff for later feedback."
   (let* ((formatted (concat diff (llm-buddy--format-notes key)))
          (prompt (llm-make-chat-prompt
                   formatted
-                  :context (llm-buddy--instructions)
-                  :tools (list llm-buddy-tool-read-buffer
-                               llm-buddy-tool-note
-                               llm-buddy-tool-remove-note
-                               llm-buddy-tool-update-note
-                               llm-buddy-tool-end)
+                  :context (concat (llm-buddy--instructions)
+                                   (when notes-only
+                                     "\nReview existing notes only.  Remove corrected notes, update inaccurate notes, or leave them alone.  Do not identify new problems or fix buffer content."))
+                  :tools (append (unless notes-only (list llm-buddy-tool-note))
+                                 (list llm-buddy-tool-read-buffer
+                                       llm-buddy-tool-remove-note
+                                       llm-buddy-tool-update-note
+                                       llm-buddy-tool-end))
                   :tool-options (make-llm-tool-options :tool-choice 'any))))
-    (llm-buddy--iterate key prompt reviewed-through llm-buddy-max-iterations)))
+    (llm-buddy--iterate key prompt reviewed-through llm-buddy-max-iterations
+                        notes-only)))
 
 (defun llm-buddy--decision-questions (notes)
   "Return editing, severity, and edited-NOTES questions for one call."
@@ -1271,13 +1295,13 @@ ITERATIONS-LEFT bounds the tool-use loop."
    (list
     (make-llm-question-choice
      :name 'diff_editing_state
-     :instructions "Does the changed text look unfinished because the user is still composing it?  Judge the changed text, especially near the cursor.  A closed expression is complete even on the cursor line; a definite error in it does not mean it is still being edited."
-     :choices '((in_progress . "The changed text is visibly unfinished")
-                (finished . "The changed text is complete enough to review")
+     :instructions "Is there positive evidence that the user has finished composing or revising the changed text?  Consider the logical unit and cursor position.  Balanced parentheses, closed function calls, and valid syntax alone do not establish completion.  Prefer in_progress or uncertain when the cursor is within the changed text and further edits are plausible.  Choose finished only when the text appears settled, for example when the user has moved beyond the completed logical unit."
+     :choices '((in_progress . "The user appears to still be composing or revising the changed text")
+                (finished . "There is clear evidence that editing of the changed text is finished")
                 (uncertain . "The diff does not show whether it is finished")))
     (make-llm-question-choice
      :name 'diff_severity
-     :instructions "If the changed text is complete enough to review, does it contain a clear, real problem?  Check completed function calls for missing required arguments and other definite errors.  A closed expression is eligible for review even on the cursor line.  Ignore speculative concerns.  Choose the highest severity found."
+     :instructions "If editing of the changed text appears finished, does it contain a clear, real problem?  Ignore speculative concerns and text that the user is still composing or revising.  Choose the highest severity found."
      :choices '((none . "No clear problem")
                 (trivial . "A typo, wording, or similarly minor mistake")
                 (significant . "A real mistake affecting the intended result")
@@ -1297,8 +1321,10 @@ ITERATIONS-LEFT bounds the tool-use loop."
     notes)))
 
 (defun llm-buddy--handle-decision
-    (result key diff notes reviewed-through)
-  "Act on RESULT for DIFF and edited NOTES in KEY."
+    (result key diff notes reviewed-through feedback-ready)
+  "Act on RESULT for DIFF and edited NOTES in KEY.
+FEEDBACK-READY records whether the idle delay had elapsed when the
+request started.  New feedback also requires enough idle time now."
   (let ((unresolved nil))
     (dolist (note notes)
       (let* ((answer (alist-get
@@ -1333,14 +1359,15 @@ ITERATIONS-LEFT bounds the tool-use loop."
            (confidence (when (llm-decision-choice-p answer)
                          (llm-decision-choice-confidence answer))))
       (pcase (cond
-              ((and editing-confident (eq editing-choice 'in_progress))
-               'in_progress)
-              ((and editing-confident (eq editing-choice 'finished)
-                    (not unresolved))
-               severity)
-              (t 'needs-chat-review))
-        ('in_progress
-         (llm-buddy--finish-advice (unless unresolved reviewed-through)))
+              ((not (and feedback-ready (llm-buddy--feedback-ready-p)
+                         editing-confident (eq editing-choice 'finished)))
+               'defer-feedback)
+              (unresolved 'needs-chat-review)
+              (t severity))
+        ('defer-feedback
+         (if unresolved
+             (llm-buddy--start-chat-advice key diff reviewed-through t)
+           (llm-buddy--finish-advice)))
         ('none (if (and (numberp confidence)
                         (>= confidence llm-buddy--decision-min-confidence))
                    (llm-buddy--finish-advice reviewed-through)
@@ -1358,20 +1385,21 @@ ITERATIONS-LEFT bounds the tool-use loop."
 
 (defun llm-buddy--start-decision (key diff reviewed-through)
   "Classify DIFF and edited notes in one asynchronous call."
-  (let ((notes (llm-buddy--pending-notes key)))
+  (let ((notes (llm-buddy--pending-notes key))
+        (feedback-ready (llm-buddy--feedback-ready-p)))
     (condition-case err
         (llm-decide-async
          llm-buddy-decision-provider
          (llm-buddy--decision-questions notes) diff
          (lambda (result)
            (llm-buddy--handle-decision
-            result key diff notes reviewed-through))
+            result key diff notes reviewed-through feedback-ready))
          (lambda (_ error-message)
            (message "Decision failed: %s" error-message)
-           (llm-buddy--start-chat-advice key diff reviewed-through)))
+           (llm-buddy--finish-advice)))
       (error
        (message "Error starting decision: %s" (error-message-string err))
-       (llm-buddy--start-chat-advice key diff reviewed-through)))))
+       (llm-buddy--finish-advice)))))
 
 (defun llm-buddy-advice ()
   "Provide feedback on recent changes in all tracked buffers.

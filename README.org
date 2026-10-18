@@ -29,18 +29,22 @@ formats the net change as a numbered unified diff.  On idle, or when you call
 Inline note overlays stay visible while you edit.  Changes anywhere in the
 review scope queue active notes for review after idle time, so corrections
 outside the annotated line can also remove obsolete notes.  Uncertain note
-decisions fall back to full chat review, even when the diff is clean.  Notes can also be dismissed manually
-with ~llm-buddy-dismiss-note~ and ~llm-buddy-dismiss-notes~.
+decisions can use chat review, even when the diff is clean.  Before new feedback
+is allowed, that chat can only update or remove existing notes.  Notes can also
+be dismissed manually with ~llm-buddy-dismiss-note~ and ~llm-buddy-dismiss-notes~.
 
 When ~llm-buddy-decision-provider~ is set to a decision model (see the [[https://github.com/ahyatt/llm#decisions][LLM readme]]
 for what this means), this quick and cheap model is used to check the buffer
 more often for issues, and can clear obsolete notes much more quickly.  In this
-mode, automatic checks default to five seconds apart after half a second of idle
-time; configure ~llm-buddy-decision-interval~ and ~llm-buddy-decision-idle-delay~ to
-adjust this.  The same decision call also checks whether the new text still
-looks unfinished.  Confidently unfinished text is left alone until the next
-edit; completed text is checked for problems.  Existing notes are still
-checked for corrections in that call.
+mode, existing notes are checked after half a second of idle time, controlled by
+~llm-buddy-decision-idle-delay~.  New suggestions and automatic fixes wait for
+~llm-buddy-feedback-idle-delay~ (default three seconds idle); regular checks are
+at least ~llm-buddy-decision-interval~ seconds apart (default five).  The same
+decision call asks whether editing is finished, classifies errors, and checks
+existing notes for corrections.  New feedback requires a =finished= answer with at
+least 0.8 confidence.  Unfinished, uncertain, missing, or failed editing
+decisions defer new feedback and leave the changes pending for a later check.
+Balanced parentheses alone do not establish that editing is finished.
 
 * Setup
 
