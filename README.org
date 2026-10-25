@@ -57,11 +57,14 @@ Load the package and configure an ~llm~ provider:
 #+begin_src emacs-lisp
 (add-to-list 'load-path "~/src/llm-buddy")
 (require 'llm-buddy)
+(require 'llm-openai)
 
-;; Example only: set this to whatever provider object your llm setup uses.
-(setq llm-buddy-provider my-llm-provider)
+;; Example only: set this to whatever provider object your llm setup uses, and
+;; use a real key.
+(setq llm-buddy-provider (make-llm-openai :chat-model "gpt-6-luna" :key my-openai-key))
 ;; Optional fast classifier, for example a TypeSafe decision provider:
-;; (setq llm-buddy-decision-provider my-decision-provider)
+;; (require 'llm-typesafe)
+;; (setq llm-buddy-decision-provider (make-llm-typesafe :key my-typsafe-key))
 #+end_src
 
 For details on setting up providers, see [[https://github.com/ahyatt/llm][the LLM package]].  The LLM package supports most major providers, including local ones.
