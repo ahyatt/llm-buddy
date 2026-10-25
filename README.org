@@ -26,10 +26,29 @@ formats the net change as a numbered unified diff.  On idle, or when you call
 ~llm-buddy-advice~, it sends that diff to the configured provider from the
 ~llm~ package.
 
-Inline note overlays stay visible when the annotated line is edited.  After
-idle time, llm-buddy asks the LLM to review the changed line and either leave
-the note alone, update it, or remove it.  Notes can also be dismissed manually
-with ~llm-buddy-dismiss-note~ and ~llm-buddy-dismiss-notes~.
+Inline note overlays stay visible while you edit.  Changes anywhere in the
+review scope queue active notes for review after idle time, so corrections
+outside the annotated line can also remove obsolete notes.  Uncertain note
+decisions can use chat review, even when the diff is clean.  Before new feedback
+is allowed, that chat can only update or remove existing notes.  Notes can also
+be dismissed manually with ~llm-buddy-dismiss-note~ and ~llm-buddy-dismiss-notes~.
+
+When ~llm-buddy-decision-provider~ is set to a decision model (see the [[https://github.com/ahyatt/llm#decisions][LLM readme]]
+for what this means), this quick and cheap model is used to check the buffer
+more often for issues, and can clear obsolete notes much more quickly.  In this
+mode, existing notes are checked after half a second of idle time, controlled by
+~llm-buddy-decision-idle-delay~.  New suggestions and automatic fixes wait for
+~llm-buddy-feedback-idle-delay~ (default three seconds idle); regular checks are
+at least ~llm-buddy-decision-interval~ seconds apart (default five).  The same
+decision call asks whether editing is finished, classifies errors, and checks
+existing notes for corrections.  New feedback requires a =finished= answer with at
+least 0.8 confidence.  Unfinished, uncertain, missing, or failed editing
+decisions defer new feedback and leave the changes pending for a later check.
+Balanced parentheses alone do not establish that editing is finished.
+
+To allow new notes and fixes, pause on a blank line after the function or
+paragraph you are editing.  Resuming edits defers feedback; corrected notes
+can disappear while you continue working.
 
 * Setup
 
@@ -38,9 +57,14 @@ Load the package and configure an ~llm~ provider:
 #+begin_src emacs-lisp
 (add-to-list 'load-path "~/src/llm-buddy")
 (require 'llm-buddy)
+(require 'llm-openai)
 
-;; Example only: set this to whatever provider object your llm setup uses.
-(setq llm-buddy-provider my-llm-provider)
+;; Example only: set this to whatever provider object your llm setup uses, and
+;; use a real key.
+(setq llm-buddy-provider (make-llm-openai :chat-model "gpt-6-luna" :key my-openai-key))
+;; Optional fast classifier, for example a TypeSafe decision provider:
+;; (require 'llm-typesafe)
+;; (setq llm-buddy-decision-provider (make-llm-typesafe :key my-typsafe-key))
 #+end_src
 
 For details on setting up providers, see [[https://github.com/ahyatt/llm][the LLM package]].  The LLM package supports most major providers, including local ones.
@@ -60,7 +84,7 @@ You can also run one review manually:
 * Configuring noted problem severity, and fixes
 Detected problems are assigned a severity, one of =trivial=, =significant= or =critical=.  You can set the minimum severity that will get a note by configuring ~llm-buddy-detect-minimum~, setting it to one of the symbols.  By default, it is set to =significant=, which should mean that problems are noted that affect whatever you are trying to do, whereas setting it to =trivial= may get typos and whitespace issues flagged as well.
 
-Problems that are below the ~llm-buddy-detect-minimum~ value can be fixed by setting ~llm-buddy-fix-unreported~ to a non-=nil= value.  If possible, the LLM will attempt to fix issues.  These fixes happen in the background when the user is idle for ~llm-buddy-fix-idle-delay~ seconds (default =3= seconds), and are not messaged to the user.  There are a variety of reasons why the fix may not happen, such as the text being changed after the problem detection.  Think of these fixes as something that might happen but aren't guaranteed to happen.
+Problems that are below the ~llm-buddy-detect-minimum~ value can be fixed by setting ~llm-buddy-fix-unreported~ to a non-=nil= value.  If possible, the LLM will attempt to fix issues.  These fixes happen in the background when the user is idle for ~llm-buddy-fix-idle-delay~ seconds (default =3= seconds), without interrupting editing.  There are a variety of reasons why the fix may not happen, such as the text being changed after the problem detection.  Think of these fixes as something that might happen but aren't guaranteed to happen.
 
 * Main commands
 
@@ -73,6 +97,8 @@ Problems that are below the ~llm-buddy-detect-minimum~ value can be fixed by set
 Useful options:
 
 - ~llm-buddy-provider~ is the provider used for advice.
+- ~llm-buddy-decision-provider~ enables fast diff and note decisions.
+- ~llm-buddy-decision-clean-confidence~ sets how certain quick checks must be to skip a full review.
 - ~llm-buddy-tracked-modes~ controls which major modes are watched.
 - ~llm-buddy-coalesce-window~ controls how nearby edits are merged.
 - ~llm-buddy-auto-interval~ controls the minimum time between automatic runs.
