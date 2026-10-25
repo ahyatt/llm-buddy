@@ -46,6 +46,10 @@ least 0.8 confidence.  Unfinished, uncertain, missing, or failed editing
 decisions defer new feedback and leave the changes pending for a later check.
 Balanced parentheses alone do not establish that editing is finished.
 
+To allow new notes and fixes, pause on a blank line after the function or
+paragraph you are editing.  Resuming edits defers feedback; corrected notes
+can disappear while you continue working.
+
 * Setup
 
 Load the package and configure an ~llm~ provider:
@@ -77,7 +81,7 @@ You can also run one review manually:
 * Configuring noted problem severity, and fixes
 Detected problems are assigned a severity, one of =trivial=, =significant= or =critical=.  You can set the minimum severity that will get a note by configuring ~llm-buddy-detect-minimum~, setting it to one of the symbols.  By default, it is set to =significant=, which should mean that problems are noted that affect whatever you are trying to do, whereas setting it to =trivial= may get typos and whitespace issues flagged as well.
 
-Problems that are below the ~llm-buddy-detect-minimum~ value can be fixed by setting ~llm-buddy-fix-unreported~ to a non-=nil= value.  If possible, the LLM will attempt to fix issues.  These fixes happen in the background when the user is idle for ~llm-buddy-fix-idle-delay~ seconds (default =3= seconds), and are not messaged to the user.  There are a variety of reasons why the fix may not happen, such as the text being changed after the problem detection.  Think of these fixes as something that might happen but aren't guaranteed to happen.
+Problems that are below the ~llm-buddy-detect-minimum~ value can be fixed by setting ~llm-buddy-fix-unreported~ to a non-=nil= value.  If possible, the LLM will attempt to fix issues.  These fixes happen in the background when the user is idle for ~llm-buddy-fix-idle-delay~ seconds (default =3= seconds), without interrupting editing.  There are a variety of reasons why the fix may not happen, such as the text being changed after the problem detection.  Think of these fixes as something that might happen but aren't guaranteed to happen.
 
 * Main commands
 
@@ -91,6 +95,7 @@ Useful options:
 
 - ~llm-buddy-provider~ is the provider used for advice.
 - ~llm-buddy-decision-provider~ enables fast diff and note decisions.
+- ~llm-buddy-decision-clean-confidence~ sets how certain quick checks must be to skip a full review.
 - ~llm-buddy-tracked-modes~ controls which major modes are watched.
 - ~llm-buddy-coalesce-window~ controls how nearby edits are merged.
 - ~llm-buddy-auto-interval~ controls the minimum time between automatic runs.
