@@ -85,7 +85,7 @@
 (ert-deftest llm-buddy-decision-questions-include-editing-state ()
   (let ((questions (llm-buddy--decision-questions nil)))
     (should (equal (mapcar #'llm-question-name questions)
-                   '(diff_editing_state diff_severity)))))
+                   '(diff_editing_state diff_completion diff_severity)))))
 
 (ert-deftest llm-buddy-editing-state-gates-error-review ()
   (dolist (case '((in_progress 0.95 finish nil)
@@ -388,21 +388,73 @@
       (should (eq called 'chat)))))
 
 
-(ert-deftest llm-buddy-review-snapshot-defers-text-and-open-expression ()
+(ert-deftest llm-buddy-review-proximity-within-the-same-function ()
   (save-window-excursion
     (with-temp-buffer
       (switch-to-buffer (current-buffer))
       (emacs-lisp-mode)
-      (insert "(list 1\n\n")
+      (insert "(defun example ()\n" (make-string 20 ?\n) "  (unfinished")
+      (goto-char (point-min)) (forward-line 10)
+      (let ((llm-buddy--review-state (llm-buddy--capture-review-state nil))
+            (llm-buddy-decision-provider nil))
+        (should (llm-buddy--review-current-p))
+        (dolist (line '(6 11 16))
+          (should-not (llm-buddy--review-current-p (current-buffer) line)))
+        (dolist (line '(5 17))
+          (should (llm-buddy--review-current-p (current-buffer) line)))
+        ;; A replacement spanning the protected area is also blocked.
+        (should-not (llm-buddy--review-current-p (current-buffer) 1 6))
+        (with-temp-buffer
+          (should (llm-buddy--review-current-p (current-buffer) 11)))
+        ;; Semantic readiness can approve nearby independent statements.
+        (let ((llm-buddy-decision-provider 'fake))
+          (should (llm-buddy--review-current-p (current-buffer) 6))))
+      (goto-char (point-max))
+      (let ((llm-buddy--review-state (llm-buddy--capture-review-state nil))
+            (llm-buddy-decision-provider 'fake))
+        ;; An unfinished nonblank expression no longer blocks earlier code.
+        (should (llm-buddy--review-current-p (current-buffer) 1))))))
+
+(ert-deftest llm-buddy-legacy-diff-protects-additions-and-deletions ()
+  (save-window-excursion
+    (with-temp-buffer
+      (switch-to-buffer (current-buffer))
+      (insert (make-string 15 ?\n))
+      (goto-char (point-min)) (forward-line 10)
       (let ((llm-buddy--review-state (llm-buddy--capture-review-state nil)))
-        ;; A thinking pause on a blank line inside an expression is not done.
-        (should-not (llm-buddy--review-current-p)))
-      (insert ")\n\n")
-      (let ((llm-buddy--review-state (llm-buddy--capture-review-state nil)))
-        (should (llm-buddy--review-current-p)))
-      (goto-char (point-min))
-      (let ((llm-buddy--review-state (llm-buddy--capture-review-state nil)))
-        (should-not (llm-buddy--review-current-p))))))
+        (dolist (case '(("@@ -1 +1 @@\n     1 +done" . nil)
+                        ("@@ -6 +6 @@\n     6 +editing" . t)
+                        ("@@ -16 +16,0 @@\n   old -deleted" . t)
+                        ("@@ -17 +17,0 @@\n   old -deleted" . nil)))
+          (should (eq (llm-buddy--diff-near-active-point-p
+                       (format "=== Buffer: %s  Mode: text-mode ===\n%s"
+                               (buffer-name) (car case)))
+                      (cdr case))))))))
+
+(ert-deftest llm-buddy-partial-decision-preserves-unfinished-changes ()
+  (save-window-excursion
+    (with-temp-buffer
+      (switch-to-buffer (current-buffer))
+      (insert "(progn\n  (completed)\n  (unfinished")
+      (let* ((key (llm-buddy--history-key))
+             (llm-buddy--review-state (llm-buddy--capture-review-state nil))
+             (llm-buddy--active-advice-scope-key key)
+             (llm-buddy--last-advice-times (make-hash-table :test 'equal))
+             (llm-buddy-advice-done-hook nil)
+             routed)
+        (cl-letf (((symbol-function 'llm-buddy--feedback-ready-p) (lambda () t))
+                  ((symbol-function 'llm-buddy--start-chat-advice)
+                   (lambda (&rest _) (setq routed t))))
+          (llm-buddy--handle-decision
+           (list (cons 'diff_editing_state
+                       (make-llm-decision-choice :choice 'finished :confidence 0.99))
+                 (cons 'diff_severity
+                       (make-llm-decision-choice :choice 'significant :confidence 0.99)))
+           key "diff" nil (current-time) t)
+          (should routed)
+          (should (plist-get llm-buddy--review-state :partial))
+          (llm-buddy--finish-advice (current-time))
+          (should-not (gethash key llm-buddy--last-advice-times)))))))
 
 (ert-deftest llm-buddy-stale-chat-cannot-add-note-or-consume-edits ()
   (save-window-excursion
@@ -567,6 +619,7 @@
             (end (copy-marker (point-max) t))
             (position (point))
             (llm-buddy-provider 'fake)
+            (llm-buddy-decision-provider 'fake)
             replace finish)
         (cl-letf (((symbol-function 'current-idle-time) (lambda () 20))
                   ((symbol-function 'llm-chat-async)
@@ -672,6 +725,7 @@
         (insert "teh report\n\n")
         (switch-to-buffer (current-buffer))
         (let ((llm-buddy--review-state (llm-buddy--capture-review-state nil))
+              (llm-buddy-decision-provider 'fake)
               (llm-buddy--notes nil)
               (llm-buddy--note-overlays nil)
               (llm-buddy--active-advice-scope-key (llm-buddy--history-key))
@@ -702,6 +756,131 @@
                 (should (= (length llm-buddy--notes) 1))
                 (should (equal fix-result "Fix applied."))
                 (should (equal (buffer-string) "the report\n\n"))))))))))
+
+(ert-deftest llm-buddy-completion-controls-diff-watermark ()
+  (dolist (case '((complete 0.99 t) (complete 0.6 nil)
+                  (unfinished 0.99 nil) (missing 0.99 nil)))
+    (save-window-excursion
+      (with-temp-buffer
+        (switch-to-buffer (current-buffer))
+        (insert "Finished.\n\n")
+        (let* ((key (llm-buddy--history-key))
+               (llm-buddy--review-state (llm-buddy--capture-review-state nil))
+               (llm-buddy--active-advice-scope-key key)
+               (llm-buddy--last-advice-times (make-hash-table :test 'equal))
+               (llm-buddy-advice-done-hook nil))
+          (cl-letf (((symbol-function 'llm-buddy--feedback-ready-p) (lambda () t)))
+            (llm-buddy--handle-decision
+             (list (cons 'diff_editing_state
+                         (make-llm-decision-choice :choice 'finished :confidence 0.99))
+                   (cons 'diff_completion
+                         (make-llm-decision-choice :choice (nth 0 case)
+                                                   :confidence (nth 1 case)))
+                   (cons 'diff_severity
+                         (make-llm-decision-choice :choice 'none :confidence 0.99)))
+             key "diff" nil (current-time) t)
+            (should (eq (not (null (gethash key llm-buddy--last-advice-times)))
+                        (nth 2 case)))))))))
+
+(ert-deftest llm-buddy-legacy-review-adds-distant-note-keeps-nearby-edits ()
+  (save-window-excursion
+    (with-temp-buffer
+      (switch-to-buffer (current-buffer))
+      (insert "Completed but wrong.\n" (make-string 10 ?\n) "Still editing")
+      (let* ((key (llm-buddy--history-key))
+             (llm-buddy-provider 'fake)
+             (llm-buddy-decision-provider nil)
+             (llm-buddy--advice-running nil)
+             (llm-buddy--notes nil)
+             (llm-buddy--note-overlays nil)
+             (llm-buddy-advice-start-functions nil)
+             (llm-buddy-advice-tool-functions nil)
+             (llm-buddy-advice-done-hook nil)
+             (llm-buddy--last-advice-times (make-hash-table :test 'equal)))
+        (cl-letf (((symbol-function 'current-idle-time) (lambda () 20))
+                  ((symbol-function 'llm-buddy--reviewable-changes-since)
+                   (lambda (&rest _) (list (list :buffer (buffer-name)))))
+                  ((symbol-function 'llm-buddy-format-diff)
+                   (lambda (_)
+                     (format "=== Buffer: %s  Mode: text-mode ===\n@@ -0,0 +1,12 @@\n     1 +Completed but wrong.\n    12 +Still editing" (buffer-name))))
+                  ((symbol-function 'llm-buddy--start-chat-advice)
+                   (lambda (_key _diff cutoff &optional _)
+                     (should (plist-get llm-buddy--review-state :partial))
+                     (llm-buddy--add-note (buffer-name) 1 "Completed problem" 'significant)
+                     (should (= (length llm-buddy--notes) 1))
+                     (should (string-match-p
+                              "deferred" (llm-buddy--add-note (buffer-name) 12
+                                                              "Unfinished" 'significant)))
+                     (should (string-match-p
+                              "deferred" (llm-buddy--replace-trivial-line
+                                          (buffer-name) 12 "Still editing" "Bad fix")))
+                     (llm-buddy--finish-advice cutoff))))
+          (llm-buddy-advice)
+          (should-not (gethash key llm-buddy--last-advice-times))
+          (should (string-suffix-p "Still editing" (buffer-string))))))))
+
+(ert-deftest llm-buddy-pending-fix-preserves-approval-snapshot ()
+  (dolist (change '(none cursor foreground-edit target-edit))
+    (save-window-excursion
+      (with-temp-buffer
+        (switch-to-buffer (current-buffer))
+        (insert "teh report\n" (make-string 15 ?\n))
+        (let ((llm-buddy-provider 'fake)
+              (llm-buddy-decision-provider 'fake)
+              (llm-buddy--review-state (llm-buddy--capture-review-state nil))
+              (llm-buddy--fix-timers (make-hash-table :test 'equal))
+              timer-call replace finish)
+          (cl-letf (((symbol-function 'current-idle-time) (lambda () 20))
+                    ((symbol-function 'run-with-idle-timer)
+                     (lambda (_delay _repeat function &rest args)
+                       (setq timer-call (cons function args)) 'fake-timer))
+                    ((symbol-function 'llm-chat-async)
+                     (lambda (_provider prompt success _error &rest _)
+                       (setq replace (llm-tool-function (car (llm-chat-prompt-tools prompt)))
+                             finish success))))
+            (llm-buddy--attempt-fix (buffer-name) 1 "Spelling")
+            (let ((pending (gethash (list (current-buffer) 1) llm-buddy--fix-timers)))
+              (pcase change
+                ('cursor (goto-char 4))
+                ('foreground-edit (insert "Still writing"))
+                ('target-edit (save-excursion (goto-char 1) (insert "X"))))
+              (apply (car timer-call) (cdr timer-call))
+              (if (eq change 'none)
+                  (progn
+                    (should replace)
+                    (should (equal (funcall replace "the report") "Fix applied."))
+                    (funcall finish nil))
+                ;; Invalidated approval must be discarded before any provider call.
+                (should-not replace)
+                (should (string-match-p "teh report" (buffer-string))))
+              (should-not (gethash (list (current-buffer) 1) llm-buddy--fix-timers))
+              (should-not (marker-buffer (plist-get pending :beg)))
+              (should-not (marker-buffer (plist-get pending :end))))))))))
+
+(ert-deftest llm-buddy-note-rejects-invalid-lines-before-proximity-or-fixes ()
+  (dolist (provider '(nil fake))
+    (dolist (severity '(significant trivial))
+      (save-window-excursion
+        (with-temp-buffer
+          (switch-to-buffer (current-buffer))
+          (insert "First\nStill editing")
+          (let ((llm-buddy-decision-provider provider)
+                (llm-buddy-detect-minimum 'significant)
+                (llm-buddy-fix-unreported t)
+                (llm-buddy--review-state (llm-buddy--capture-review-state nil))
+                (llm-buddy--notes nil)
+                (llm-buddy--note-overlays nil)
+                (llm-buddy--active-advice-scope-key nil)
+                scheduled)
+            (cl-letf (((symbol-function 'current-idle-time) (lambda () 20))
+                      ((symbol-function 'llm-buddy--attempt-fix)
+                       (lambda (&rest _) (setq scheduled t))))
+              (dolist (line '(999 999999999999999999999999999 0 -1 1.5 nil invalid "999" "oops"))
+                (should (string-match-p
+                         "invalid" (llm-buddy--add-note (buffer-name) line "Problem" severity))))
+              (should-not scheduled)
+              (should-not llm-buddy--notes)
+              (should-not llm-buddy--note-overlays))))))))
 
 (provide 'llm-buddy-test)
 ;;; llm-buddy-test.el ends here

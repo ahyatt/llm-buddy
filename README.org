@@ -40,15 +40,13 @@ mode, existing notes are checked after half a second of idle time, controlled by
 ~llm-buddy-decision-idle-delay~.  New suggestions and automatic fixes wait for
 ~llm-buddy-feedback-idle-delay~ (default three seconds idle); regular checks are
 at least ~llm-buddy-decision-interval~ seconds apart (default five).  The same
-decision call asks whether editing is finished, classifies errors, and checks
-existing notes for corrections.  New feedback requires a =finished= answer with at
-least 0.8 confidence.  Unfinished, uncertain, missing, or failed editing
-decisions defer new feedback and leave the changes pending for a later check.
-Balanced parentheses alone do not establish that editing is finished.
+decision call checks which regions are ready, classifies errors, and reviews
+existing notes.  New feedback requires at least 0.8 confidence that an
+independent region is ready; unfinished changes stay pending for a later check.
 
-To allow new notes and fixes, pause on a blank line after the function or
-paragraph you are editing.  Resuming edits defers feedback; corrected notes
-can disappear while you continue working.
+New notes and fixes wait until you move to an different part of the text.
+Without a decision provider, the five lines on either side of the cursor are
+left for a later review.
 
 * Setup
 

@@ -6,7 +6,7 @@
 ;; Homepage: https://github.com/ahyatt/llm-buddy
 ;; Package-Requires: ((emacs "28.1") (llm "0.33.0"))
 ;; Keywords: convenience, tools
-;; Version: 0.2.0
+;; Version: 0.2.1
 ;; SPDX-License-Identifier: GPL-3.0-or-later
 ;;
 ;; This program is free software; you can redistribute it and/or
@@ -198,20 +198,47 @@ A background fix can track foreground activity separately from its target."
              (with-current-buffer buffer
                (= (point) (plist-get llm-buddy--review-state :point)))))))
 
-(defun llm-buddy--review-current-p ()
-  "Whether new feedback is safe for the current review snapshot.
-A blank line outside an open expression is necessary, but the decision
-model must still establish that the logical unit is finished."
-  (or (null llm-buddy--review-state)
-      (and (llm-buddy--review-unchanged-p)
-           (with-current-buffer (plist-get llm-buddy--review-state :buffer)
-             (and (save-excursion
-                    (beginning-of-line)
-                    (looking-at-p "[ \t]*$"))
-                  (let ((syntax (syntax-ppss)))
-                    (and (zerop (car syntax))
-                         (not (nth 3 syntax))
-                         (not (nth 4 syntax)))))))))
+(defconst llm-buddy--editing-line-radius 5
+  "Lines on either side of the active cursor protected without a decision model.")
+
+(defun llm-buddy--near-active-point-p (buffer line &optional end-line)
+  "Whether BUFFER's LINE through END-LINE overlaps the active editing area."
+  (let ((active (or (plist-get llm-buddy--review-state :buffer)
+                    (window-buffer (selected-window)))))
+    (and (eq buffer active) (integerp line)
+         (with-current-buffer active
+           (let ((cursor (line-number-at-pos)))
+             (and (<= line (+ cursor llm-buddy--editing-line-radius))
+                  (>= (or end-line line)
+                      (- cursor llm-buddy--editing-line-radius))))))))
+
+(defun llm-buddy--review-current-p (&optional buffer line end-line)
+  "Whether feedback still matches the snapshot and is away from active editing.
+With a decision provider, semantic readiness is decided by the model.
+Otherwise protect BUFFER's LINE through END-LINE within five cursor lines."
+  (and (llm-buddy--review-unchanged-p)
+       (or llm-buddy-decision-provider
+           (not (llm-buddy--near-active-point-p buffer line end-line)))))
+
+(defun llm-buddy--diff-near-active-point-p (diff)
+  "Whether numbered DIFF changes overlap the active editing area.
+Deleted text is tested at its current insertion position."
+  (let (buffer line near)
+    (dolist (text (split-string diff "\n") near)
+      (cond
+       ((string-match "^=== Buffer: \\(.*?\\)  Mode:" text)
+        (setq buffer (get-buffer (match-string 1 text)) line nil))
+       ((string-match "^@@ .* +\\+\\([0-9]+\\)" text)
+        (setq line (string-to-number (match-string 1 text))))
+       ((string-match "^ *\\([0-9]+\\) \\([+ ]\\)" text)
+        (setq line (string-to-number (match-string 1 text)))
+        (when (and (equal (match-string 2 text) "+")
+                   (llm-buddy--near-active-point-p buffer line))
+          (setq near t))
+        (setq line (1+ line)))
+       ((and (string-prefix-p "   old -" text)
+             (llm-buddy--near-active-point-p buffer line))
+        (setq near t))))))
 
 (defvar-local llm-buddy--pending-old-text nil
   "Full lines about to be replaced by the current change.")
@@ -605,14 +632,25 @@ code locations for notes."
                            (goto-char (point-max))
                            (skip-chars-backward " \t\n\r")
                            (line-number-at-pos))))
-    (format "The cursor is %s, %s.%s"
-            (if blank "on a blank line" "within a nonblank line")
-            (if (or (> (car syntax) 0) (nth 3 syntax) (nth 4 syntax))
-                "inside an open expression, string, or comment"
-              "outside strings and open expressions")
-            (if (> line last-text-line)
-                " It is after the last nonblank line of this buffer."
-              ""))))
+    (concat
+     (if (eq (current-buffer) (window-buffer (selected-window)))
+         "Active editing cursor. " "Inactive buffer: saved cursor only. ")
+     (format "The cursor is %s, %s.%s"
+             (if blank "on a blank line" "within a nonblank line")
+             (if (or (> (car syntax) 0) (nth 3 syntax) (nth 4 syntax))
+                 "inside an open expression, string, or comment"
+               "outside strings and open expressions")
+             (if (> line last-text-line)
+                 " It is after the last nonblank line of this buffer."
+               ""))
+     (when (eq (current-buffer) (window-buffer (selected-window)))
+       (concat "\nCurrent editing neighborhood (context, not necessarily changed):\n"
+               (save-excursion
+                 (forward-line (- llm-buddy--editing-line-radius))
+                 (beginning-of-line)
+                 (let ((beg (point)))
+                   (forward-line (1+ (* 2 llm-buddy--editing-line-radius)))
+                   (buffer-substring-no-properties beg (point)))))))))
 
 (defun llm-buddy-format-diff (changes)
   "Format CHANGES (oldest first) as a consolidated diff string for an LLM.
@@ -751,14 +789,16 @@ REASON describes what dismissed the note."
         (cons beg end)))))
 
 (defun llm-buddy--start-fix-request
-    (buffer beg-marker end-marker original-content note mode)
+    (buffer beg-marker end-marker original-content note mode &optional approved-state)
   "Request a fix for ORIGINAL-CONTENT in BUFFER.
 BEG-MARKER and END-MARKER track its bounds, NOTE describes the problem,
-and MODE is the buffer's major mode when the problem was detected."
+and MODE is the buffer's major mode when the problem was detected.
+APPROVED-STATE preserves the review snapshot across an idle timer."
   (let ((applied nil)
-        (review-state (with-current-buffer buffer
-                        (llm-buddy--capture-review-state
-                         nil (window-buffer (selected-window))))))
+        (review-state (or approved-state
+                          (with-current-buffer buffer
+                            (llm-buddy--capture-review-state
+                             nil (window-buffer (selected-window)))))))
     (cl-labels
         ((cleanup ()
            (set-marker beg-marker nil)
@@ -779,7 +819,11 @@ and MODE is the buffer's major mode when the problem was detected."
             ((not (and (>= (float-time (or (current-idle-time) 0))
                            llm-buddy-fix-idle-delay)
                        (let ((llm-buddy--review-state review-state))
-                         (llm-buddy--review-current-p))))
+                         (llm-buddy--review-current-p
+                          buffer
+                          (with-current-buffer buffer (line-number-at-pos beg-marker))
+                          (with-current-buffer buffer
+                            (line-number-at-pos (max beg-marker (1- end-marker))))))))
              "Fix deferred because editing resumed.")
             (t
              (with-current-buffer buffer
@@ -822,19 +866,23 @@ and MODE is the buffer's major mode when the problem was detected."
                   (error-message-string err))))))))
 
 (defun llm-buddy--run-pending-fix
-    (key buffer beg-marker end-marker original-content note mode)
-  "Run the pending automatic fix identified by KEY."
+    (key buffer beg-marker end-marker original-content note mode
+         &optional approved-state)
+  "Run the pending automatic fix identified by KEY if APPROVED-STATE is current."
   (remhash key llm-buddy--fix-timers)
-  (if (and (buffer-live-p buffer)
-           (marker-buffer beg-marker)
-           (marker-buffer end-marker)
-           (equal original-content
-                  (with-current-buffer buffer
-                    (buffer-substring-no-properties beg-marker end-marker))))
-      (llm-buddy--start-fix-request
-       buffer beg-marker end-marker original-content note mode)
-    (set-marker beg-marker nil)
-    (set-marker end-marker nil)))
+  (let ((llm-buddy--review-state approved-state))
+    (if (and approved-state
+             (llm-buddy--review-unchanged-p)
+             (buffer-live-p buffer)
+             (marker-buffer beg-marker)
+             (marker-buffer end-marker)
+             (equal original-content
+                    (with-current-buffer buffer
+                      (buffer-substring-no-properties beg-marker end-marker))))
+        (llm-buddy--start-fix-request
+         buffer beg-marker end-marker original-content note mode approved-state)
+      (set-marker beg-marker nil)
+      (set-marker end-marker nil))))
 
 (defun llm-buddy--attempt-fix (buffer-name line-number note)
   "Schedule a fix for NOTE at BUFFER-NAME:LINE-NUMBER after idle time."
@@ -848,6 +896,10 @@ and MODE is the buffer's major mode when the problem was detected."
                      (end-marker (copy-marker end t))
                      (original-content
                       (buffer-substring-no-properties beg end))
+                     (approved-state
+                      (or llm-buddy--review-state
+                          (llm-buddy--capture-review-state
+                           nil (window-buffer (selected-window)))))
                      (key (list buffer line-number))
                      (old (gethash key llm-buddy--fix-timers)))
           (when old
@@ -859,7 +911,7 @@ and MODE is the buffer's major mode when the problem was detected."
                   llm-buddy-fix-idle-delay nil
                   #'llm-buddy--run-pending-fix
                   key buffer beg-marker end-marker original-content note
-                  major-mode)))
+                  major-mode approved-state)))
             (puthash key (list :timer timer
                                :beg beg-marker
                                :end end-marker)
@@ -1006,9 +1058,14 @@ we will attempt to fix it if `llm-buddy-fix-unreported' is non-nil."
          (severity-idx (llm-buddy--severity-to-idx severity-symbol))
          (min-severity-idx (llm-buddy--severity-to-idx llm-buddy-detect-minimum)))
     (cond ((stringp buf) buf)
-          ((not (and (llm-buddy--review-current-p)
+          ((not (and (integerp line-num) (> line-num 0)
+                     (<= line-num
+                         (with-current-buffer buf
+                           (line-number-at-pos (point-max))))))
+           (format "Cannot add note because line number %S is invalid." line-number))
+          ((not (and (llm-buddy--review-current-p buf line-num)
                      (llm-buddy--feedback-ready-p)))
-           "Feedback deferred because editing resumed or the cursor is within text.")
+           "Feedback deferred because editing resumed or the target is near the active cursor.")
           ((null severity-idx)
            (format "Cannot add note because severity %S is invalid." severity))
           ((null min-severity-idx)
@@ -1273,7 +1330,7 @@ call and its result.")
     (concat
      "You are a helpful assistant running in Emacs.  As the user goes about their work, you observe the changes they make to their files.  The changes you see may span multiple changed buffers." proj-info "  You will provide feedback on recent changes in tracked buffers, including suggestions for improvement or correction.  You only comment on things that could be improved, and you never say anything if there is nothing worth remarking about.
 
-The diff headers show where the user's cursor currently is.  The cursor position indicates what the user is actively working on.  Defer feedback on text that the user appears to be composing or revising near the cursor.  Balanced parentheses or a closed expression alone do not establish that editing is finished.
+The diff headers identify the active editing cursor; saved cursors in other buffers do not indicate active editing.  Review completed regions independent of the part being edited, even in the same function.  Defer feedback and fixes on unfinished or actively revised text, including problems whose correctness depends on it.  Without a decision provider, do not add notes or fixes within five lines of the active cursor; leave that area for a later review.  Balanced parentheses or a closed expression alone do not establish that editing is finished.
 
 Only note real problems, not hypothetical ones.  So, for example, note that there's a typo, a bug, or a bad idea, but if you see something and wonder if it is correct, but have no evidence to the contrary, ignore it.  Remember that you do not have access to the latest information about the world, so do not try to speculate about the correctness about external facts that seem recent and beyond your range of knowledge.
 
@@ -1292,17 +1349,18 @@ The user may make changes, and you will have the chance to comment on those chan
   "Finish the current advice run.
 When REVIEWED-THROUGH is non-nil, record that changes through that
 time were reviewed successfully.  When NOTES-ONLY is non-nil, clear
-reviewed note flags without marking the diff as reviewed."
+reviewed note flags without marking the diff as reviewed.
+Partial reviews also retain the diff until every changed region is ready."
   (when (and reviewed-through
              (or notes-only
                  (and (llm-buddy--review-current-p)
                       (llm-buddy--feedback-ready-p))))
-    (unless notes-only
+    (unless (or notes-only (plist-get llm-buddy--review-state :partial))
       (setq llm-buddy--last-advice-time reviewed-through))
     (when llm-buddy--active-advice-scope-key
       (llm-buddy--clear-reviewed-note-flags
        llm-buddy--active-advice-scope-key reviewed-through)
-      (unless notes-only
+      (unless (or notes-only (plist-get llm-buddy--review-state :partial))
         (puthash llm-buddy--active-advice-scope-key reviewed-through
                  llm-buddy--last-advice-times))))
   (setq llm-buddy--active-advice-scope-key nil
@@ -1333,7 +1391,7 @@ diff for a later review."
                            ((assoc "end" (plist-get response :tool-results))
                             (llm-buddy--finish-advice reviewed-through notes-only))
                            (t (llm-buddy--iterate key prompt reviewed-through
-                                                 (1- iterations-left) notes-only))))
+                                                  (1- iterations-left) notes-only))))
                         (lambda (_ err)
                           (message "Error getting LLM advice: %s" (or err "unknown error"))
                           (llm-buddy--finish-advice))
@@ -1347,9 +1405,9 @@ diff for a later review."
   (let ((buffer (llm-buddy--find-buffer buffer-name)))
     (cond
      ((not (bufferp buffer)) buffer)
-     ((not (and (llm-buddy--review-current-p)
+     ((not (and (llm-buddy--review-current-p buffer line-number)
                 (llm-buddy--feedback-ready-p)))
-      "Fix deferred because editing resumed or the cursor is within text.")
+      "Fix deferred because editing resumed or the target is near the active cursor.")
      ((not (and (integerp line-number) (> line-number 0)
                 (stringp old-text) (stringp new-text)
                 (not (string-match-p "\n" new-text))))
@@ -1426,13 +1484,18 @@ preserve the diff for later feedback."
    (list
     (make-llm-question-choice
      :name 'diff_editing_state
-     :instructions "Has the user moved beyond a completed logical unit in the added text?  Classify finished if an earlier function, paragraph, or statement is complete and the cursor has moved to a later blank line or a different unit.  Classify in_progress if the cursor is inside an incomplete or actively revised unit.  Classify uncertain if this cannot be established.  Judge the earlier completed unit independently of later unrelated text.  Balanced delimiters alone do not establish completion."
-     :choices '((finished . "Completed logical unit behind the cursor")
-                (in_progress . "Still composing that logical unit")
-                (uncertain . "Cannot establish completion")))
+     :instructions "Is at least one changed region ready for feedback, independently of what the user is currently editing?  Choose finished when a completed statement, expression, or paragraph is independent of the active editing area.  The user can be editing a different part of the SAME FUNCTION: an earlier completed calculation or statement can be ready even while a later statement and the enclosing function remain unfinished.  Do not require a blank cursor line, a different function, or the whole diff to be finished.  Choose in_progress when every changed region is still being composed or depends on the unfinished text.  Choose uncertain if no independent completed region can be established.  Balanced delimiters alone do not establish completion."
+     :choices '((finished . "At least one independently completed changed region is ready")
+                (in_progress . "All changed regions are still being edited or depend on unfinished text")
+                (uncertain . "Cannot establish any independently completed region")))
+    (make-llm-question-choice
+     :name 'diff_completion
+     :instructions "Are ALL changed regions finished and ready for review?  Choose complete only if no changed text is still being composed or revised near the active cursor.  Choose unfinished if any changed region remains in progress, even when other independent regions are ready for feedback."
+     :choices '((complete . "All changed regions are finished")
+                (unfinished . "Some changed text remains in progress")))
     (make-llm-question-choice
      :name 'diff_severity
-     :instructions "Classify the correctness of added lines independently of editing state; a separate decision controls when feedback is allowed.  Check for definite errors in calculations, units, statements, or program behavior, using surrounding text as context.  Ignore removed lines and speculative concerns.  Choose the highest severity found."
+     :instructions "Classify only added lines in completed regions independent of the active editing area, including completed statements within the same unfinished function.  Ignore problems in the actively edited region and anything that may be resolved by finishing it.  Check for definite errors in calculations, units, statements, or program behavior, using surrounding text as context.  Ignore removed lines and speculative concerns.  Choose the highest severity found."
      :choices '((none . "No clear problem")
                 (trivial . "A typo, wording, or similarly minor mistake")
                 (significant . "A real mistake affecting the intended result")
@@ -1493,6 +1556,16 @@ request started.  New feedback also requires enough idle time now."
                        (llm-decision-choice-choice answer)))
            (confidence (when (llm-decision-choice-p answer)
                          (llm-decision-choice-confidence answer))))
+      ;; Readiness of one region must not consume other unfinished changes.
+      ;; Missing or uncertain completion evidence conservatively retains them.
+      (when llm-buddy--review-state
+        (let ((completion (alist-get 'diff_completion result)))
+          (setf (plist-get llm-buddy--review-state :partial)
+                (not (and (llm-decision-choice-p completion)
+                          (eq (llm-decision-choice-choice completion) 'complete)
+                          (numberp (llm-decision-choice-confidence completion))
+                          (>= (llm-decision-choice-confidence completion)
+                              llm-buddy--decision-min-confidence))))))
       (pcase (cond
               ((not (and feedback-ready (llm-buddy--feedback-ready-p)
                          (llm-buddy--review-current-p)
@@ -1573,6 +1646,9 @@ The output is added as overlay text in the relevant buffer."
          (concat diff-formatted (llm-buddy--format-notes key)))
         (setq llm-buddy--active-advice-scope-key key
               llm-buddy--review-state (llm-buddy--capture-review-state changes))
+        (unless llm-buddy-decision-provider
+          (setf (plist-get llm-buddy--review-state :partial)
+                (llm-buddy--diff-near-active-point-p diff-formatted)))
         (setq llm-buddy--advice-running t)
         (if llm-buddy-decision-provider
             (llm-buddy--start-decision key diff-formatted reviewed-through)
