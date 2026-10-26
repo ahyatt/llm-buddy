@@ -789,14 +789,16 @@ REASON describes what dismissed the note."
         (cons beg end)))))
 
 (defun llm-buddy--start-fix-request
-    (buffer beg-marker end-marker original-content note mode)
+    (buffer beg-marker end-marker original-content note mode &optional approved-state)
   "Request a fix for ORIGINAL-CONTENT in BUFFER.
 BEG-MARKER and END-MARKER track its bounds, NOTE describes the problem,
-and MODE is the buffer's major mode when the problem was detected."
+and MODE is the buffer's major mode when the problem was detected.
+APPROVED-STATE preserves the review snapshot across an idle timer."
   (let ((applied nil)
-        (review-state (with-current-buffer buffer
-                        (llm-buddy--capture-review-state
-                         nil (window-buffer (selected-window))))))
+        (review-state (or approved-state
+                          (with-current-buffer buffer
+                            (llm-buddy--capture-review-state
+                             nil (window-buffer (selected-window)))))))
     (cl-labels
         ((cleanup ()
            (set-marker beg-marker nil)
@@ -864,19 +866,23 @@ and MODE is the buffer's major mode when the problem was detected."
                   (error-message-string err))))))))
 
 (defun llm-buddy--run-pending-fix
-    (key buffer beg-marker end-marker original-content note mode)
-  "Run the pending automatic fix identified by KEY."
+    (key buffer beg-marker end-marker original-content note mode
+         &optional approved-state)
+  "Run the pending automatic fix identified by KEY if APPROVED-STATE is current."
   (remhash key llm-buddy--fix-timers)
-  (if (and (buffer-live-p buffer)
-           (marker-buffer beg-marker)
-           (marker-buffer end-marker)
-           (equal original-content
-                  (with-current-buffer buffer
-                    (buffer-substring-no-properties beg-marker end-marker))))
-      (llm-buddy--start-fix-request
-       buffer beg-marker end-marker original-content note mode)
-    (set-marker beg-marker nil)
-    (set-marker end-marker nil)))
+  (let ((llm-buddy--review-state approved-state))
+    (if (and approved-state
+             (llm-buddy--review-unchanged-p)
+             (buffer-live-p buffer)
+             (marker-buffer beg-marker)
+             (marker-buffer end-marker)
+             (equal original-content
+                    (with-current-buffer buffer
+                      (buffer-substring-no-properties beg-marker end-marker))))
+        (llm-buddy--start-fix-request
+         buffer beg-marker end-marker original-content note mode approved-state)
+      (set-marker beg-marker nil)
+      (set-marker end-marker nil))))
 
 (defun llm-buddy--attempt-fix (buffer-name line-number note)
   "Schedule a fix for NOTE at BUFFER-NAME:LINE-NUMBER after idle time."
@@ -890,6 +896,10 @@ and MODE is the buffer's major mode when the problem was detected."
                      (end-marker (copy-marker end t))
                      (original-content
                       (buffer-substring-no-properties beg end))
+                     (approved-state
+                      (or llm-buddy--review-state
+                          (llm-buddy--capture-review-state
+                           nil (window-buffer (selected-window)))))
                      (key (list buffer line-number))
                      (old (gethash key llm-buddy--fix-timers)))
           (when old
@@ -901,7 +911,7 @@ and MODE is the buffer's major mode when the problem was detected."
                   llm-buddy-fix-idle-delay nil
                   #'llm-buddy--run-pending-fix
                   key buffer beg-marker end-marker original-content note
-                  major-mode)))
+                  major-mode approved-state)))
             (puthash key (list :timer timer
                                :beg beg-marker
                                :end end-marker)
@@ -1048,6 +1058,11 @@ we will attempt to fix it if `llm-buddy-fix-unreported' is non-nil."
          (severity-idx (llm-buddy--severity-to-idx severity-symbol))
          (min-severity-idx (llm-buddy--severity-to-idx llm-buddy-detect-minimum)))
     (cond ((stringp buf) buf)
+          ((not (and (integerp line-num) (> line-num 0)
+                     (<= line-num
+                         (with-current-buffer buf
+                           (line-number-at-pos (point-max))))))
+           (format "Cannot add note because line number %S is invalid." line-number))
           ((not (and (llm-buddy--review-current-p buf line-num)
                      (llm-buddy--feedback-ready-p)))
            "Feedback deferred because editing resumed or the target is near the active cursor.")

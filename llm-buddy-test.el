@@ -819,5 +819,68 @@
           (should-not (gethash key llm-buddy--last-advice-times))
           (should (string-suffix-p "Still editing" (buffer-string))))))))
 
+(ert-deftest llm-buddy-pending-fix-preserves-approval-snapshot ()
+  (dolist (change '(none cursor foreground-edit target-edit))
+    (save-window-excursion
+      (with-temp-buffer
+        (switch-to-buffer (current-buffer))
+        (insert "teh report\n" (make-string 15 ?\n))
+        (let ((llm-buddy-provider 'fake)
+              (llm-buddy-decision-provider 'fake)
+              (llm-buddy--review-state (llm-buddy--capture-review-state nil))
+              (llm-buddy--fix-timers (make-hash-table :test 'equal))
+              timer-call replace finish)
+          (cl-letf (((symbol-function 'current-idle-time) (lambda () 20))
+                    ((symbol-function 'run-with-idle-timer)
+                     (lambda (_delay _repeat function &rest args)
+                       (setq timer-call (cons function args)) 'fake-timer))
+                    ((symbol-function 'llm-chat-async)
+                     (lambda (_provider prompt success _error &rest _)
+                       (setq replace (llm-tool-function (car (llm-chat-prompt-tools prompt)))
+                             finish success))))
+            (llm-buddy--attempt-fix (buffer-name) 1 "Spelling")
+            (let ((pending (gethash (list (current-buffer) 1) llm-buddy--fix-timers)))
+              (pcase change
+                ('cursor (goto-char 4))
+                ('foreground-edit (insert "Still writing"))
+                ('target-edit (save-excursion (goto-char 1) (insert "X"))))
+              (apply (car timer-call) (cdr timer-call))
+              (if (eq change 'none)
+                  (progn
+                    (should replace)
+                    (should (equal (funcall replace "the report") "Fix applied."))
+                    (funcall finish nil))
+                ;; Invalidated approval must be discarded before any provider call.
+                (should-not replace)
+                (should (string-match-p "teh report" (buffer-string))))
+              (should-not (gethash (list (current-buffer) 1) llm-buddy--fix-timers))
+              (should-not (marker-buffer (plist-get pending :beg)))
+              (should-not (marker-buffer (plist-get pending :end))))))))))
+
+(ert-deftest llm-buddy-note-rejects-invalid-lines-before-proximity-or-fixes ()
+  (dolist (provider '(nil fake))
+    (dolist (severity '(significant trivial))
+      (save-window-excursion
+        (with-temp-buffer
+          (switch-to-buffer (current-buffer))
+          (insert "First\nStill editing")
+          (let ((llm-buddy-decision-provider provider)
+                (llm-buddy-detect-minimum 'significant)
+                (llm-buddy-fix-unreported t)
+                (llm-buddy--review-state (llm-buddy--capture-review-state nil))
+                (llm-buddy--notes nil)
+                (llm-buddy--note-overlays nil)
+                (llm-buddy--active-advice-scope-key nil)
+                scheduled)
+            (cl-letf (((symbol-function 'current-idle-time) (lambda () 20))
+                      ((symbol-function 'llm-buddy--attempt-fix)
+                       (lambda (&rest _) (setq scheduled t))))
+              (dolist (line '(999 999999999999999999999999999 0 -1 1.5 nil invalid "999" "oops"))
+                (should (string-match-p
+                         "invalid" (llm-buddy--add-note (buffer-name) line "Problem" severity))))
+              (should-not scheduled)
+              (should-not llm-buddy--notes)
+              (should-not llm-buddy--note-overlays))))))))
+
 (provide 'llm-buddy-test)
 ;;; llm-buddy-test.el ends here
